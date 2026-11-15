@@ -1,0 +1,1928 @@
+#!/usr/bin/env python3
+"""cairn-node: the node side of Cairn. Stdlib only, Python 3.11+.
+
+Commands (all print JSON; failure prints {"error": ...} and exits 1):
+  snapshot | read <project> <relpath> | init <project> | start <project> [--model A] [--subagent-model A]
+  relead <project> | usage <project>
+  stop <project> | review <project> | pane <project> [--review]
+  ticket <project>   (stdin: one JSON op: create | close | out-of-scope | blockers)
+  chat <project> [--resume]   (stdin: token line, then claude stream-json; execs claude)
+  answer <project>   (stdin: {"id", "choice", "note", "fingerprint" (optional)})
+  dialog <project> | dialog-answer <project> <fingerprint> <n>
+"""
+import json
+import sys
+
+# Ahead of the other imports. The file parses on 3.8, so an older python3 gets this error instead of a traceback.
+if sys.version_info < (3, 11):
+    print(json.dumps({"error": "cairn-node needs Python 3.11 or newer; %s is %d.%d.%d"
+                               % ((sys.executable,) + tuple(sys.version_info[:3]))}))
+    sys.exit(1)
+
+import contextlib
+import errno
+import fcntl
+import hashlib
+import os
+import platform
+import re
+import shutil
+import socket
+import stat
+import subprocess
+import tempfile
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "0.4.6"  # 0.2.0: models and result (milestone 7); 0.3.0: lead state, relead, usage; 0.3.1: timed limit note;
+                   # 0.3.2: the limit note names the node's zone; 0.4.0: dialog, dialog-answer;
+                   # 0.4.1: the agent list under the input box no longer hides a limit;
+                   # 0.4.2: a lead at its prompt while its background agents write counts as working;
+                   # 0.4.3: release-audit fixes; question fingerprint, lead "unknown";
+                   # 0.4.4: refuses a Python older than 3.11 with a one-line error;
+                   # 0.4.5: the start watch reads only what follows this start's prompt echo;
+                   # 0.4.6: the snapshot says whether claude on the node has a login of its own
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+REVIEW_SUFFIX = "-review"
+TICKET_TYPES = ("research", "prototype", "grilling", "task", "build")
+STATUS_RE = re.compile(r"^(working \S+|idle|done)$")
+OPTION_RE = re.compile(r"^([A-Z])\.\s+(.*\S)\s*$")
+MAX_READ_BYTES = 2 * 1024 * 1024
+START_PROMPT = "Read LEAD.md and work the map."
+CONTINUE_PROMPT = "Read new answer files in work/inbox and check work/tickets for open tickets added while you were away (the dashboard can add them), then carry on per LEAD.md."
+REVIEW_PROMPT = "/cairn-review"
+TOKEN_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
+MIN_TMUX = (3, 2)
+FIFO_TIMEOUT = 10
+TMUX_TIMEOUT = 15
+TRUST_TRIES = 5
+START_WAIT = 8
+START_POLL = 0.5
+LOCK_TRIES = 5
+LOCK_DELAY = 1.0
+# git errors that mean another git process holds a lock; retried.
+LOCK_ERRORS = ("index.lock", "cannot lock ref")
+TICKET_LOCK_WAIT = 30
+DASHBOARD_IDENTITY = ("cairn dashboard", "dashboard@cairn.local")
+# Pane text that means claude came up without a usable login (login_failure says where it counts).
+AUTH_FAILURES = ("Not logged in", "Please run /login", "Run /login", "Invalid API key", "OAuth token has expired")
+# Pane command: read the token line from the FIFO, remove it, export it only
+# when non-empty, then exec claude. The token never appears in any argv.
+PANE_SH = ('f=$1; m=$2; shift 2; IFS= read -r t < "$f"; rm -f "$f"; '
+           'if [ -n "$t" ]; then CLAUDE_CODE_OAUTH_TOKEN=$t; export CLAUDE_CODE_OAUTH_TOKEN; '
+           'else unset CLAUDE_CODE_OAUTH_TOKEN; fi; unset t; '
+           'if [ -n "$m" ]; then CLAUDE_CODE_SUBAGENT_MODEL=$m; export CLAUDE_CODE_SUBAGENT_MODEL; '
+           'else unset CLAUDE_CODE_SUBAGENT_MODEL; fi; unset m; exec "$@"')
+MODELS = ("fable", "opus", "sonnet", "haiku")
+SUBAGENT_VAR = "CLAUDE_CODE_SUBAGENT_MODEL"
+RESULT_MAX = 4000
+
+
+class CairnError(Exception):
+    def __init__(self, message, **extra):
+        super().__init__(message)
+        self.extra = extra
+
+
+def home():
+    return Path(os.environ.get("HOME") or os.path.expanduser("~"))
+
+
+def cairn_home():
+    return home() / ".cairn"
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def read_file(path, limit=MAX_READ_BYTES, errors="replace", whole=False):
+    """At most `limit` bytes of the regular file at `path`, as text. A lead owns the repo, so never through a
+    symlink and never blocking on a FIFO: anything but a regular file raises OSError. With `whole`, a longer file
+    raises OSError too, for callers that write the text back."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", str(path))
+        data = f.read(limit + 1 if whole else limit)
+    if len(data) > limit:
+        raise OSError(errno.EFBIG, "file too large", str(path))
+    return data.decode(errors=errors)
+
+
+def run(argv, cwd=None, stdin=None, timeout=15, env=None):
+    try:
+        return subprocess.run(argv, cwd=cwd, input=stdin, capture_output=True,
+                              text=True, timeout=timeout, env=env)
+    except FileNotFoundError:
+        raise CairnError(f"{argv[0]} not found")
+    except subprocess.TimeoutExpired:
+        raise CairnError(f"{argv[0]} timed out")
+
+
+# ---------- frontmatter ----------
+
+DQ_RE = re.compile(r'^"((?:[^"\\]|\\.)*)"\s*(?:#.*)?$')
+SQ_RE = re.compile(r"^'((?:[^']|'')*)'\s*(?:#.*)?$")
+
+
+def parse_scalar(raw):
+    raw = raw.strip()
+    m = DQ_RE.match(raw)
+    if m:
+        try:
+            return json.loads(f'"{m.group(1)}"')
+        except ValueError:
+            return m.group(1)
+    m = SQ_RE.match(raw)
+    if m:
+        return m.group(1).replace("''", "'")
+    m = re.search(r"\s#", raw)
+    if m:
+        raw = raw[:m.start()].rstrip()
+    if raw.startswith("#"):
+        return ""
+    if raw in ("null", "~"):
+        return ""
+    if raw.startswith("[") and raw.endswith("]"):
+        inner = raw[1:-1].strip()
+        return [parse_scalar(p) for p in inner.split(",") if p.strip()] if inner else []
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+        return raw[1:-1]
+    return raw
+
+
+def parse_frontmatter(text):
+    """Return (meta, body). Raises ValueError on an unclosed block."""
+    text = text.lstrip("﻿").replace("\r\n", "\n")
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return {}, text
+    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+    if end is None:
+        raise ValueError("frontmatter is not closed")
+    meta, key = {}, None
+    for line in lines[1:end]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        item = re.match(r"^\s+-\s*(.*)$", line) or re.match(r"^-\s+(.*)$", line)
+        if item and key is not None and meta.get(key) in ("", []):
+            if meta[key] == "":
+                meta[key] = []
+            meta[key].append(parse_scalar(item.group(1)))
+            continue
+        m = re.match(r"^([A-Za-z_][\w-]*)\s*:\s*(.*)$", line)
+        if m:
+            key = m.group(1)
+            meta[key] = parse_scalar(m.group(2))
+    return meta, "\n".join(lines[end + 1:])
+
+
+def as_list(value):
+    if isinstance(value, list):
+        return [str(v) for v in value if str(v)]
+    return [str(value)] if value else []
+
+
+def norm_id(value):
+    value = str(value).strip()
+    return value.lstrip("0") or "0" if value.isdigit() else value
+
+
+def truthy(value):
+    return str(value).strip().lower() in ("yes", "true", "y", "1")
+
+
+# ---------- registry ----------
+
+def load_projects():
+    path = cairn_home() / "projects.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        raise CairnError(f"cannot read {path}: {e}")
+    return data if isinstance(data, dict) else {}
+
+
+def update_projects(change):
+    """Apply change(projects) to the registry and save it, reloading under a lock first so that an init that
+    finishes while another one clones never loses its entry. Returns what change returns."""
+    ch = cairn_home()
+    ch.mkdir(parents=True, exist_ok=True)
+    fd = os.open(ch / "projects.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        data = load_projects()
+        result = change(data)
+        tmp = ch / f"projects.json.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        os.replace(tmp, ch / "projects.json")
+        return result
+    finally:
+        os.close(fd)
+
+
+def project_path(project):
+    if not NAME_RE.match(project or ""):
+        raise CairnError(f"invalid project name: {project!r}")
+    entry = load_projects().get(project)
+    if not entry or not entry.get("path"):
+        raise CairnError(f"unknown project: {project}")
+    path = Path(entry["path"])
+    if not path.is_dir():
+        raise CairnError(f"project path missing: {path}")
+    return path
+
+
+def marker(project):
+    return cairn_home() / "state" / f"{project}.started"
+
+
+# ---------- tmux ----------
+
+def tmux_env():
+    # A cairn-node run from inside a session (a lead or review pane) has
+    # the token in its environment; keep it out of the tmux server's.
+    return {k: v for k, v in os.environ.items() if k != TOKEN_VAR}
+
+
+def tmux(*args, stdin=None, timeout=None):
+    timeout = timeout or float(os.environ.get("CAIRN_TMUX_TIMEOUT", TMUX_TIMEOUT))
+    return run(["tmux", "-L", "cairn", *args], stdin=stdin, env=tmux_env(), timeout=timeout)
+
+
+def session_alive(name, timeout=None):
+    """True or False; None when tmux did not answer (timed out, not found), which proves neither."""
+    try:
+        return tmux("has-session", "-t", f"={name}", timeout=timeout).returncode == 0
+    except CairnError:
+        return None
+
+
+def read_token():
+    line = sys.stdin.readline()
+    token = line.strip()
+    if any(c.isspace() for c in token):
+        raise CairnError("token must not contain whitespace")
+    return token
+
+
+def resolve_claude():
+    found = shutil.which("claude")
+    if found:
+        return os.path.abspath(found)
+    local = home() / ".local" / "bin" / "claude"
+    if local.is_file() and os.access(local, os.X_OK):
+        return str(local)
+    return None
+
+
+def require_tmux():
+    try:
+        r = run(["tmux", "-V"], timeout=5)
+    except CairnError:
+        raise CairnError("tmux not found")
+    m = re.search(r"(\d+)\.(\d+)", r.stdout or r.stderr or "")
+    if not m:
+        raise CairnError(f"cannot read the tmux version: {(r.stdout or r.stderr).strip()!r}")
+    if (int(m.group(1)), int(m.group(2))) < MIN_TMUX:
+        raise CairnError(f"tmux 3.2 or later is required, found {m.group(0)}")
+
+
+def file_version(path):
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return None
+    return st.st_ino, st.st_mtime_ns, st.st_size
+
+
+def trust_project(path):
+    """Merge onboarding, bypass-permissions and folder trust into ~/.claude.json. A running claude also writes the
+    file, so the merge starts again when the file changed while it ran (this narrows the race; it cannot close it)."""
+    cfg = home() / ".claude.json"
+    for _ in range(TRUST_TRIES):
+        seen = file_version(cfg)
+        if merge_trust(cfg, path, seen):
+            return
+    raise CairnError(f"{cfg} kept changing while cairn-node merged its settings; try again")
+
+
+def merge_trust(cfg, path, seen):
+    """One merge; False when the file is no longer the version `seen`, and nothing was written."""
+    data = {}
+    if seen is not None:
+        try:
+            data = json.loads(cfg.read_text() or "{}")
+        except (OSError, ValueError) as e:
+            raise CairnError(f"cannot read {cfg}: {e}")
+        if not isinstance(data, dict):
+            raise CairnError(f"{cfg} is not a JSON object")
+    before = json.dumps(data, sort_keys=True)
+    data["hasCompletedOnboarding"] = True
+    data["bypassPermissionsModeAccepted"] = True
+    projects = data.get("projects")
+    if not isinstance(projects, dict):
+        projects = data["projects"] = {}
+    for p in {str(path), str(Path(path).resolve())}:
+        entry = projects.get(p)
+        if not isinstance(entry, dict):
+            entry = projects[p] = {}
+        entry["hasTrustDialogAccepted"] = True
+    if json.dumps(data, sort_keys=True) == before:
+        return True
+    mode = cfg.stat().st_mode & 0o777 if cfg.exists() else 0o600
+    tmp = cfg.with_name(f".claude.json.cairn-{os.getpid()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(data, indent=2) + "\n")
+    if file_version(cfg) != seen:
+        os.unlink(tmp)
+        return False
+    os.replace(tmp, cfg)
+    return True
+
+
+def redact(text, token):
+    return text.replace(token, "***") if token else text
+
+
+TOKEN_RE = re.compile(r"sk-ant-[A-Za-z0-9_-]+")
+
+
+def pane_lines(name, count=60, timeout=None):
+    """The pane's last `count` lines, with anything shaped like an Anthropic token replaced by ***: the node does
+    not know the token here, and the lines reach the dashboard (pane, dialog, pane_last, lead_note)."""
+    r = tmux("capture-pane", "-p", "-t", f"={name}:", "-S", f"-{count}", timeout=timeout)
+    if r.returncode != 0:
+        return None
+    lines = TOKEN_RE.sub("***", r.stdout).split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return lines[-count:]
+
+
+BOX_CHARS = set("─━│┃╭╮╰╯┌┐└┘═║╔╗╚╝ ")
+PANE_CHROME = ("bypass permissions", "shift+tab", "? for shortcuts", "auto-accept edits", "Try \"")
+
+
+LIMIT_RE = re.compile(r"usage limit|hit your (session |weekly |daily |opus |sonnet |fable )?limit|"
+                      r"reached your .{0,20}limit|limit reached|resets (at|in) ", re.I)
+RESET_TIME_RE = re.compile(r"\bresets\s+(at\s+|in\s+)?\d|automatically at\s+\d", re.I)
+ZONE_RE = re.compile(r"\d\s*(am|pm)?\s*\([A-Za-z_/+-]+\)", re.I)
+CLOCK_RE = re.compile(r"(?:resets\s+(?:at\s+)?|automatically at\s+)\d{1,2}(?::\d{2})?(?:\s*[ap]m)?", re.I)
+ZONE_NAME_RE = re.compile(r"^(UTC|GMT|[A-Za-z_]+(?:/[A-Za-z_+-]+)+)$")
+DIALOG_RE = re.compile(r"^\s*❯\s*1\.|Do you want to|Would you like to")
+PROMPT_RE = re.compile(r"^\s*[│┃]?\s*[❯>]\s*[│┃]?\s*$")
+
+
+STATE_LINES = 40
+AGENTS_QUIET = 15 * 60   # seconds since a background agent last wrote before its lead counts as stopped
+
+
+def pane_view(name):
+    """(last line, lead state, note) from one capture of the lead's pane; all None when the capture fails,
+    which never drops the project from the snapshot."""
+    try:
+        lines = pane_lines(name, STATE_LINES, timeout=3)
+    except CairnError:
+        lines = None
+    if lines is None:
+        return None, None, None
+    return pane_last(lines), *lead_state(lines)
+
+
+def agents_writing(name, repo):
+    """Whether a background agent of the lead's session wrote its transcript in the last AGENTS_QUIET seconds."""
+    sid = load_session_id(name)
+    if not sid:
+        return False
+    since = time.time() - AGENTS_QUIET
+    for p in dict.fromkeys((repo, repo.resolve())):
+        folder = home() / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(p)) / sid / "subagents"
+        try:
+            if any(f.stat().st_mtime >= since for f in folder.glob("*.jsonl")):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def clean_line(line):
+    return line.strip().strip("│┃").strip()
+
+
+def node_zone():
+    """This node's zone as the hub reads it ("UTC" or an IANA name); None when it cannot be told."""
+    name = (os.environ.get("TZ") or "").lstrip(":")
+    if not ZONE_NAME_RE.match(name):
+        try:
+            link = os.path.realpath("/etc/localtime")
+            name = link.split("zoneinfo/", 1)[1] if "zoneinfo/" in link else ""
+        except OSError:
+            name = ""
+    if not ZONE_NAME_RE.match(name):
+        try:
+            name = Path("/etc/timezone").read_text().strip()
+        except OSError:
+            name = ""
+    if ZONE_NAME_RE.match(name):
+        return name
+    return "UTC" if time.timezone == 0 and not time.daylight else None
+
+
+def with_zone(note):
+    """The note with this node's zone after a clock time that has none: Claude Code prints the time on the node's
+    clock, and the hub would otherwise read it on the Mac's."""
+    m = CLOCK_RE.search(note)
+    zone = m and not re.match(r"\s*\(", note[m.end():]) and node_zone()
+    return note[:m.end()] + " (%s)" % zone + note[m.end():] if zone else note
+
+
+SPINNER_RE = re.compile(r"^\s*[✢✻✶✳✽✺·]\s+\S.*…\s*\(")   # "✻ Thinking… (12s · …"
+
+
+def message_lines(tail):
+    """How many lines at the top of `tail` are the lead's message: its ● line and the lines indented past the ●
+    (its wrapped text and paragraphs), up to a ⎿ line or a line no deeper than the ●."""
+    col, n = tail[0].index("●"), 1
+    for i, l in enumerate(tail[1:], 1):
+        if not l.strip():
+            continue
+        if len(l) - len(l.lstrip()) <= col or clean_line(l).startswith("⎿"):
+            break
+        n = i + 1
+    return n
+
+
+def lead_state(lines):
+    """working, limit, dialog, prompt or unknown, with the line that says so. Only what follows the lead's last
+    message (its last ● line above the input box) counts, so the lead's own words never read as a dialog or a limit,
+    and the agent list under the box ("● main") is never taken for that message."""
+    boxes = [i for i, l in enumerate(lines) if PROMPT_RE.match(l)]
+    above = lines[:boxes[-1]] if boxes else lines
+    bullets = [i for i, l in enumerate(above) if clean_line(l).startswith("●")]
+    tail = lines[bullets[-1]:] if bullets else lines
+    if any("esc to interrupt" in l or SPINNER_RE.match(l) for l in tail):
+        return "working", None
+    after = tail[message_lines(tail):] if bullets else tail   # the lead's message itself never reads as a limit
+    limits = [clean_line(l) for l in after
+              if (clean_line(l).startswith("⎿") and LIMIT_RE.search(l)) or ("limit" in l.lower() and "reset" in l.lower())]
+    if limits:
+        # the hub reads the reset time from the note: a line naming its zone beats the Mac's zone, and a "resets"
+        # line beats the menu's "continue automatically at"
+        timed = [(ZONE_RE.search(l) is not None, "resets" in l.lower(), i, l)
+                 for i, l in enumerate(map(clean_line, after)) if RESET_TIME_RE.search(l)]
+        if timed:
+            return "limit", with_zone(max(timed)[3])[:200]
+        return "limit", next((l for l in reversed(limits) if "reset" in l.lower()), limits[-1])[:200]
+    box = any(PROMPT_RE.match(l) for l in tail)
+    if not box and any(DIALOG_RE.search(l) for l in lines[-12:]):   # Claude Code's dialogs replace the input box
+        return "dialog", next((clean_line(l)[:200] for l in reversed(lines[-12:]) if clean_line(l).endswith("?")), None)
+    if box:
+        return "prompt", None
+    return "unknown", None
+
+
+RULE_CHARS = set("─━╌╍┄┅┈┉═")
+AUTO_DENY_RE = re.compile(r"will automatically deny this request in \d")
+OPTION_LINE_RE = re.compile(r"^(\s*)(❯\s*)?(\d+)\.\s+(.*\S)\s*$")
+DIALOG_LINES = 200
+
+
+def read_dialog(lines):
+    """The dialog the lead's pane shows, or None unless lead_state says dialog. The block runs from the
+    dialog's top border (else the line after the lead's last ● line) to the end of the pane."""
+    if lead_state(lines[-STATE_LINES:])[0] != "dialog":
+        return None
+    bullets = [i for i, l in enumerate(lines) if clean_line(l).startswith("●")]
+    start = bullets[-1] + 1 if bullets else 0
+    rule = next((i for i in range(start, len(lines)) if is_rule(lines[i])), None)
+    block = [l.rstrip() for l in lines[start if rule is None else rule:]]
+    while block and (not block[0].strip() or is_rule(block[0])):
+        block.pop(0)
+    while block and not block[-1].strip():
+        block.pop()
+    options, selected = dialog_options(block)
+    return {"lines": block, "options": options, "selected": selected,
+            "fingerprint": hashlib.sha256("\n".join(steady(block)).encode()).hexdigest()}
+
+
+def steady(lines):
+    """The dialog's lines without blanks and without Claude Code's auto-deny countdown, which ticks every second
+    and goes (with its spacing) at the first key, so it never makes the same dialog look like a different one."""
+    return [l for l in lines if l.strip() and not AUTO_DENY_RE.search(l)]
+
+
+def is_rule(line):
+    text = line.strip()
+    return bool(text) and set(text) <= RULE_CHARS
+
+
+def dialog_options(block):
+    """([{"n", "label"}], n under the ❯ marker) from the numbered list that holds the marker; a label that wraps
+    continues on lines indented past its number."""
+    marked = next((i for i in range(len(block) - 1, -1, -1)
+                   if (m := OPTION_LINE_RE.match(block[i])) and m.group(2)), None)
+    if marked is None:
+        return [], None
+    first = next((i for i in range(marked, -1, -1) if (m := OPTION_LINE_RE.match(block[i])) and m.group(3) == "1"), None)
+    if first is None:
+        return [], None
+    options, selected, col = [], None, 0
+    for line in block[first:]:
+        m = OPTION_LINE_RE.match(line)
+        if m and int(m.group(3)) == len(options) + 1:
+            options.append({"n": int(m.group(3)), "label": m.group(4)})
+            col = len(m.group(1)) + len(m.group(2) or "")
+            if m.group(2):
+                selected = options[-1]["n"]
+        elif options and line.strip() and len(line) - len(line.lstrip()) > col:
+            options[-1]["label"] += " " + line.strip()
+        else:
+            break
+    return (options, selected) if selected is not None else ([], None)
+
+
+def pane_last(lines):
+    """The lead's latest meaningful pane line (activity or output). Everything from Claude Code's
+    input prompt down is the input box and footer, so the search starts above the last prompt."""
+    prompts = [i for i, l in enumerate(lines) if l.strip().strip("│┃").strip().startswith((">", "❯"))]
+    if prompts:
+        lines = lines[:prompts[-1]]
+    for line in reversed(lines):
+        text = line.strip().strip("│┃").strip()
+        if not text or set(text) <= BOX_CHARS or text.startswith((">", "❯")) or any(c in text for c in PANE_CHROME):
+            continue
+        return text[:160]
+    return None
+
+
+def deliver_token(fifo, token):
+    deadline = time.monotonic() + float(os.environ.get("CAIRN_FIFO_TIMEOUT", FIFO_TIMEOUT))
+    while True:
+        try:
+            fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            break
+        except OSError as e:
+            if e.errno != errno.ENXIO or time.monotonic() > deadline:
+                return False
+            time.sleep(0.02)
+    try:
+        os.set_blocking(fd, True)
+        os.write(fd, (token + "\n").encode())
+    finally:
+        os.close(fd)
+    return True
+
+
+def new_session(name, path, token, claude_args, prompt, subagent_model=None, started=None):
+    """Start claude in tmux session `name` with `prompt`, token via FIFO; fail if it dies at once. `started` runs
+    once claude has its token, before the watch, so a lead that outlives a failed watch is still on record."""
+    require_tmux()
+    claude = resolve_claude()
+    if not claude:
+        raise CairnError("claude not found on PATH or in ~/.local/bin")
+    trust_project(path)
+    rundir = cairn_home() / "run"
+    rundir.mkdir(parents=True, exist_ok=True)
+    os.chmod(rundir, 0o700)
+    tdir = tempfile.mkdtemp(prefix=f"{name}-", dir=rundir)
+    fifo = os.path.join(tdir, "token")
+    try:
+        os.mkfifo(fifo, 0o600)
+        r = tmux("new-session", "-d", "-s", name, "-c", str(path), "--",
+                 "/bin/sh", "-c", PANE_SH, "cairn-pane", fifo, subagent_model or "",
+                 claude, "--dangerously-skip-permissions", *claude_args, prompt)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "tmux failed").strip()
+            raise CairnError(f"tmux new-session failed: {redact(err, token)}")
+        try:
+            # The pane blocks on the FIFO until the token is written, so
+            # remain-on-exit is on before claude can exit.
+            tmux("set-option", "-w", "-t", f"={name}:", "remain-on-exit", "on")
+            if not deliver_token(fifo, token):
+                raise CairnError(f"session {name} did not read its token")
+        except BaseException:
+            # left alone, the pane waits forever on a FIFO that is about to go and reads as already running
+            with contextlib.suppress(CairnError):
+                tmux("kill-session", "-t", f"={name}")
+            raise
+    finally:
+        shutil.rmtree(tdir, ignore_errors=True)
+    if started:
+        started()
+    try:
+        watch_start(name, token, prompt)
+    finally:   # also after a failed watch, or the lead's dead pane would keep its session "running"
+        with contextlib.suppress(CairnError):
+            tmux("set-option", "-w", "-t", f"={name}:", "remain-on-exit", "off")
+
+
+def prompt_echo(lines, prompt):
+    """Index of the newest line where Claude Code echoes `prompt` (`❯ <prompt>`, its first wrapped line), or None."""
+    for i in range(len(lines) - 1, -1, -1):
+        text = lines[i].strip()
+        if text.startswith("❯"):
+            shown = text[1:].strip()
+            if shown == prompt or (len(shown) >= 20 and prompt.startswith(shown)):
+                return i
+    return None
+
+
+def login_failure(lines, prompt):
+    """The pane line that says claude has no usable login for this start, or None. Only lines after the newest echo
+    of this start's prompt count: a resumed lead replays its history first, and the lead's own words there may quote
+    these messages (#35). The real failure follows the echo, as a `⎿` line, as the newest `●` line, or in the footer
+    under the input box (node/tests/fixtures/login-panes). Without an echo, the last 15 lines count, as before."""
+    i = prompt_echo(lines, prompt)
+    region = lines[i + 1:] if i is not None else [l for l in lines if l.strip()][-15:]
+    return next((l.strip() for l in region if any(m in l for m in AUTH_FAILURES)), None)
+
+
+def watch_start(name, token, prompt):
+    """Poll the new pane for START_WAIT seconds; kill the session and fail if
+    claude dies or shows a login problem (it stays alive when not logged in).
+    A lead that ends its own session within the window has finished, not failed."""
+    deadline = time.monotonic() + float(os.environ.get("CAIRN_START_WAIT", START_WAIT))
+    while True:
+        time.sleep(max(0.0, min(START_POLL, deadline - time.monotonic())))
+        r = tmux("display-message", "-p", "-t", f"={name}:", "#{pane_dead}")
+        if r.returncode != 0 and session_alive(name) is False:
+            # remain-on-exit keeps a crashed pane; a session that is gone was ended by the
+            # lead itself (kill-session) because it had nothing more to do.
+            return
+        alive = r.returncode == 0 and r.stdout.strip() == "0"
+        pane = [redact(l, token) for l in pane_lines(name) or []]
+        auth = login_failure(pane, prompt)
+        lines = [l for l in pane if l.strip()][-15:]
+        if not alive or auth:
+            tmux("kill-session", "-t", f"={name}")
+            if alive:
+                raise CairnError(f"claude in {name} has no usable login: {auth}", pane=lines)
+            tail = "\n".join(lines).strip() or "(no output)"
+            raise CairnError(f"claude exited right after start in {name}:\n{tail}", pane=lines)
+        if time.monotonic() >= deadline:
+            return
+
+
+# ---------- snapshot ----------
+
+def dep_version(argv, pick):
+    try:
+        r = run(argv, timeout=5)
+    except CairnError:
+        return None
+    if r.returncode != 0:
+        return None
+    return pick((r.stdout or r.stderr).strip())
+
+
+def claude_login(claude):
+    """"yes", "no" or "unknown": whether claude has a login of its own here, as `claude auth status` tells a lead,
+    whose pane has no token variable. On macOS "no" reads as "unknown": over ssh claude reads its login from the
+    Keychain, and a Keychain it cannot read there may still hold one (untested)."""
+    if not claude:
+        return "unknown"
+    try:
+        r = run([claude, "auth", "status", "--json"], timeout=10, env=tmux_env())
+        logged_in = json.loads(r.stdout).get("loggedIn")
+    except (CairnError, ValueError, AttributeError):
+        return "unknown"
+    if logged_in is True:
+        return "yes"
+    return "no" if logged_in is False and sys.platform != "darwin" else "unknown"
+
+
+def first_version(text):
+    m = re.search(r"\d+(?:\.\d+)+\w*", text)
+    return m.group(0) if m else None
+
+
+def free_ram_mb():
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        out = run(["vm_stat"], timeout=5).stdout
+        page = int(re.search(r"page size of (\d+)", out).group(1))
+        pages = sum(int(re.search(rf"Pages {k}:\s+(\d+)", out).group(1))
+                    for k in ("free", "inactive"))
+        return pages * page // (1024 * 1024)
+    except Exception:
+        return None
+
+
+def section(text, heading):
+    out, on = [], False
+    for line in text.replace("\r\n", "\n").split("\n"):
+        m = re.match(r"^##\s+(.*?)\s*$", line)
+        if m:
+            on = m.group(1).lower() == heading.lower()
+            continue
+        if on:
+            out.append(line)
+    return out
+
+
+def read_map(repo, warnings, name):
+    path = repo / "work" / "map.md"
+    if not path.exists():
+        return {"destination": "", "decisions": []}
+    try:
+        text = read_file(path)
+    except OSError as e:
+        warnings.append({"warning": f"{name}: cannot read work/map.md: {e}"})
+        return {"destination": "", "decisions": []}
+    dest = " ".join(l.strip() for l in section(text, "Destination") if l.strip())
+    decisions = [l.strip() for l in section(text, "Decisions so far")
+                 if l.strip().startswith(("-", "*"))]
+    return {"destination": dest, "decisions": decisions}
+
+
+def read_tickets(repo, warnings, name):
+    tickets = []
+    tdir = repo / "work" / "tickets"
+    for f in sorted(tdir.glob("*.md")) if tdir.is_dir() else []:
+        rel = f"work/tickets/{f.name}"
+        try:
+            meta, _ = parse_frontmatter(read_file(f))
+            if not meta:
+                raise ValueError("no frontmatter")
+        except (OSError, ValueError) as e:
+            warnings.append({"warning": f"{name}: skipped {rel}: {e}"})
+            continue
+        m = re.match(r"^(\d+)", f.name)
+        tid = str(meta.get("id") or (m.group(1) if m else f.stem))
+        tickets.append({
+            "id": tid, "title": str(meta.get("title") or f.stem),
+            "type": str(meta.get("type") or ""),
+            "status": "closed" if str(meta.get("status", "")).lower() == "closed" else "open",
+            "assignee": str(meta.get("assignee") or ""),
+            "blocked_by": as_list(meta.get("blocked_by", [])),
+            "path": rel,
+        })
+    return tickets
+
+
+def read_questions(repo, warnings, name):
+    questions = []
+    idir = repo / "work" / "inbox"
+    files = sorted(idir.glob("q*.md")) if idir.is_dir() else []
+    for f in files:
+        if f.name.endswith(".answer.md"):
+            continue
+        rel = f"work/inbox/{f.name}"
+        try:
+            meta, body = parse_frontmatter(read_file(f))
+            if not meta:
+                raise ValueError("no frontmatter")
+        except (OSError, ValueError) as e:
+            warnings.append({"warning": f"{name}: skipped {rel}: {e}"})
+            continue
+        qid = str(meta.get("id") or f.stem)
+        lines = [l.rstrip() for l in body.split("\n")]
+        options = [l.strip() for l in lines if OPTION_RE.match(l.strip())]
+        context = next((l.strip() for l in lines
+                        if l.strip() and not OPTION_RE.match(l.strip())), "")
+        q = {"id": qid, "ticket": str(meta.get("ticket") or ""),
+             "gate": truthy(meta.get("gate", "no")),
+             "default": str(meta.get("default") or ""),
+             "asked_at": str(meta.get("asked_at") or ""),
+             "context": context, "options": options,
+             # what the dashboard shows; answer refuses a fingerprint that no longer matches
+             "fingerprint": hashlib.sha256("\n".join([context, *options]).encode()).hexdigest(),
+             "answered": False, "choice": None, "answered_at": None,
+             "applied": str(meta.get("applied") or "") or None, "path": rel}
+        ans = idir / f"{f.stem}.answer.md"
+        if ans.exists():
+            q["answered"] = True
+            try:
+                am, _ = parse_frontmatter(read_file(ans))
+                q["choice"] = str(am.get("choice") or "") or None
+                q["answered_at"] = str(am.get("answered_at") or "") or None
+            except (OSError, ValueError) as e:
+                warnings.append({"warning": f"{name}: bad answer file for {qid}: {e}"})
+        questions.append(q)
+    return questions
+
+
+def read_adrs(repo, warnings, name):
+    adrs = []
+    adir = repo / "work" / "adr"
+    for f in sorted(adir.glob("*.md")) if adir.is_dir() else []:
+        rel = f"work/adr/{f.name}"
+        try:
+            first = read_file(f, 4096).split("\n")[0].strip()
+        except OSError as e:
+            warnings.append({"warning": f"{name}: skipped {rel}: {e}"})
+            continue
+        m = re.match(r"^(\d+)", f.name)
+        title = re.sub(r"^#+\s*", "", first) or f.stem
+        adrs.append({"id": m.group(1) if m else f.stem, "title": title, "path": rel})
+    return adrs
+
+
+def read_commits(repo):
+    if not (repo / ".git").exists():
+        return []
+    try:
+        r = run(["git", "log", "-10", "--format=%h%x09%aI%x09%s"], cwd=repo)
+    except CairnError:
+        return []
+    if r.returncode != 0:
+        return []
+    out = []
+    for line in r.stdout.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) == 3:
+            out.append({"sha": parts[0], "date": parts[1], "subject": parts[2]})
+    return out
+
+
+def ticket_states(tickets, questions):
+    status_of = {norm_id(t["id"]): t["status"] for t in tickets}
+    waiting_on = {norm_id(q["ticket"]) for q in questions if not q["answered"] and q["ticket"]}
+    for t in tickets:
+        if t["status"] == "closed":
+            t["state"] = "closed"
+        elif norm_id(t["id"]) in waiting_on:
+            t["state"] = "waiting"
+        elif t["assignee"]:
+            t["state"] = "claimed"
+        elif any(status_of.get(norm_id(b)) == "open" for b in t["blocked_by"]):
+            t["state"] = "blocked"
+        else:
+            t["state"] = "frontier"
+
+
+LEAD_MARK_RE = re.compile(r"^<!-- cairn LEAD\.md v(\d+) -->\s*$", re.M)
+
+
+def lead_version(repo):
+    """The template version LEAD.md was rendered from; 1 for files from before the marker."""
+    try:
+        m = LEAD_MARK_RE.search(read_file(repo / "LEAD.md"))
+    except OSError:
+        return 1
+    return int(m.group(1)) if m else 1
+
+
+def template_version():
+    try:
+        m = LEAD_MARK_RE.search(find_template().read_text())
+    except (OSError, CairnError):
+        return None
+    return int(m.group(1)) if m else 1
+
+
+def read_result(repo):
+    """work/result.md when it is a regular file, capped."""
+    try:
+        text = read_file(repo / "work" / "result.md", RESULT_MAX * 4 + 4)
+    except OSError:
+        return None
+    return text[:RESULT_MAX] + "…" if len(text) > RESULT_MAX else text
+
+
+def project_snapshot(name, entry, warnings):
+    repo = Path(entry.get("path", ""))
+    if not repo.is_dir():
+        warnings.append({"warning": f"{name}: path missing: {repo}"})
+        return None
+    status = "unknown"
+    try:
+        first = read_file(repo / "work" / "status", 4096).strip().split("\n")[0].strip()
+        if STATUS_RE.match(first):
+            status = first
+    except OSError:
+        pass
+    stopped = False
+    alive = session_alive(name, timeout=3)
+    if alive:
+        lead = "alive"
+    elif alive is None:
+        lead = "unknown"   # tmux did not answer; "dead" would read as a crash on the hub
+    else:
+        lead = "dead" if marker(name).exists() else "none"
+        if lead == "dead":
+            try:
+                stopped = bool(json.loads(marker(name).read_text()).get("stopped"))
+            except (OSError, ValueError, AttributeError):
+                pass
+    tickets = read_tickets(repo, warnings, name)
+    questions = read_questions(repo, warnings, name)
+    ticket_states(tickets, questions)
+    result = read_result(repo)
+    result_sha = None
+    if result is not None and (repo / ".git").exists():
+        try:
+            r = run(["git", "log", "-1", "--format=%h", "--", "work/result.md"], cwd=repo)
+            result_sha = r.stdout.strip() or None if r.returncode == 0 else None
+        except CairnError:
+            pass
+    last, state, note = pane_view(name) if lead == "alive" else (None, None, None)
+    if state == "prompt" and agents_writing(name, repo):
+        state = "working"   # the lead ended its turn to wait for its background agents' completion notices
+    return {"name": name, "path": str(repo), "status": status, "lead": lead,
+            "lead_stopped": stopped, "pane_last": last, "lead_state": state, "lead_note": note, "lead_version": lead_version(repo),
+            "review": "alive" if session_alive(name + REVIEW_SUFFIX, timeout=3) else "none",
+            "map": read_map(repo, warnings, name), "tickets": tickets,
+            "questions": questions, "result": result, "result_sha": result_sha, "adrs": read_adrs(repo, warnings, name),
+            "commits": read_commits(repo)}
+
+
+def cmd_snapshot(args):
+    warnings, projects = [], []
+    claude = resolve_claude()
+    for name, entry in sorted(load_projects().items()):
+        try:
+            snap = project_snapshot(name, entry or {}, warnings)
+        except Exception as e:
+            warnings.append({"warning": f"{name}: {e}"})
+            continue
+        if snap:
+            projects.append(snap)
+    return {
+        "node_version": VERSION, "lead_template_version": template_version(),
+        "host": socket.gethostname(), "time": now_iso(),
+        "free_ram_mb": free_ram_mb(),
+        "free_disk_mb": shutil.disk_usage(home()).free // (1024 * 1024),
+        "deps": {
+            "tmux": dep_version(["tmux", "-V"], first_version),
+            "git": dep_version(["git", "--version"], first_version),
+            "python3": platform.python_version(),
+            "claude": dep_version([claude, "--version"], first_version) if claude else None,
+        },
+        "login": claude_login(claude),
+        "projects": projects, "warnings": warnings,
+    }
+
+
+# ---------- read ----------
+
+def cmd_read(args):
+    if len(args) != 2:
+        raise CairnError("usage: read <project> <relpath>")
+    repo = project_path(args[0]).resolve()
+    target = (repo / args[1]).resolve()
+    if target != repo and repo not in target.parents:
+        raise CairnError("path escapes the repo")
+    if not target.is_file():
+        raise CairnError(f"not a file: {args[1]}")
+    if target.stat().st_size > MAX_READ_BYTES:
+        raise CairnError("file too large")
+    return {"path": args[1], "content": read_file(target)}
+
+
+# ---------- init ----------
+
+def slugify(text):
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:50] or "ticket"
+
+
+def find_template():
+    here = Path(os.path.realpath(__file__)).parent
+    for d in (here, cairn_home()):
+        p = d / "LEAD.md.tmpl"
+        if p.is_file():
+            return p
+    raise CairnError("LEAD.md.tmpl not found next to cairn-node or in ~/.cairn")
+
+
+def render(template, values):
+    return re.sub(r"\{\{(\w+)\}\}", lambda m: values.get(m.group(1), m.group(0)), template)
+
+
+def set_git_identity(path, added):
+    """Set the lead identity where none is configured; append each key set to `added`."""
+    for key, value in (("user.name", "cairn lead"), ("user.email", "lead@cairn.local")):
+        r = run(["git", "config", "--get", key], cwd=path)
+        if r.returncode != 0 or not r.stdout.strip():
+            r = run(["git", "config", "--local", key, value], cwd=path)
+            if r.returncode != 0:
+                raise CairnError(f"git config {key} failed: {(r.stderr or r.stdout).strip()}")
+            added.append(key)
+
+
+def undo_init(path, existed, had_git, kind, files, dirs, identity):
+    """Remove what a failed init created, so the same init can be retried."""
+    if not existed:
+        shutil.rmtree(path, ignore_errors=True)
+        return
+    if kind == "clone":
+        for child in path.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+        return
+    for f, old in files.items():
+        if old is None:
+            f.unlink(missing_ok=True)
+        else:
+            f.write_text(old)
+    for d in reversed(dirs):
+        try:
+            d.rmdir()
+        except OSError:
+            pass
+    if not had_git:
+        shutil.rmtree(path / ".git", ignore_errors=True)
+        return
+    if files:   # with no paths, git reset would unstage the operator's whole index
+        run(["git", "reset", "-q", "--", *(str(f.relative_to(path)) for f in files)], cwd=path)
+    for key in identity:
+        run(["git", "config", "--local", "--unset", key], cwd=path)
+
+
+def cmd_init(args):
+    if len(args) != 1:
+        raise CairnError("usage: init <project>")
+    project = args[0]
+    if not NAME_RE.match(project):
+        raise CairnError(f"invalid project name: {project!r}")
+    if project.endswith(REVIEW_SUFFIX):   # the tmux session of project x's review is x-review
+        raise CairnError(f"a project name must not end in {REVIEW_SUFFIX}: {project!r}")
+    try:
+        spec = json.loads(sys.stdin.read())
+    except ValueError as e:
+        raise CairnError(f"init object is not valid JSON: {e}")
+    if not isinstance(spec, dict):
+        raise CairnError("init object must be a JSON object")
+    path = Path(os.path.expanduser(str(spec["path"]))) if spec.get("path") else home() / "work" / project
+    if not path.is_absolute():
+        raise CairnError("path must be absolute")
+    destination = str(spec.get("destination") or "").strip()
+    if not destination:
+        raise CairnError("init object needs a destination")
+    repo = spec.get("repo") or {}
+    kind = repo.get("kind", "new")
+    tickets = spec.get("tickets") or []
+    for t in tickets:
+        if not str(t.get("title") or "").strip():
+            raise CairnError("every ticket needs a title")
+        if t.get("type", "task") not in TICKET_TYPES:
+            raise CairnError(f"ticket type must be one of {', '.join(TICKET_TYPES)}")
+    template = find_template().read_text()
+    projects = load_projects()
+    if project in projects and projects[project].get("path") != str(path):
+        raise CairnError(f"project {project} already registered at {projects[project].get('path')}")
+
+    if kind == "clone":
+        url = repo.get("url")
+        if not url:
+            raise CairnError("clone needs repo.url")
+        if path.exists() and any(path.iterdir()):
+            raise CairnError(f"{path} is not empty")
+    elif kind == "existing":
+        if not (path / ".git").exists():
+            raise CairnError(f"{path} is not a git repo")
+    elif kind != "new":
+        raise CairnError("repo.kind must be new, clone or existing")
+    if (path / "work" / "map.md").exists():
+        raise CairnError(f"{path} already has work/map.md")
+
+    existed, had_git = path.exists(), (path / ".git").exists()
+    files, dirs, identity = {}, [], []  # what this init wrote, for undo_init
+    registered = False
+
+    def register(data):
+        """Add the project unless another init registered it elsewhere meanwhile; True when this run added it."""
+        have = data.get(project)
+        if have and have.get("path") != str(path):
+            raise CairnError(f"project {project} already registered at {have.get('path')}")
+        data[project] = {"path": str(path)}
+        return have is None
+
+    def refuse_link(rel):
+        # a cloned or existing repo may ship work/status -> ~/.cairn/projects.json
+        if (path / rel).is_symlink():
+            raise CairnError(f"{rel} is a symlink; init does not write through it")
+
+    def write(rel, text):
+        f = path / rel
+        refuse_link(rel)
+        files.setdefault(f, read_file(f, errors="strict", whole=True) if f.exists() else None)
+        fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+
+    try:
+        if kind == "clone":
+            path.parent.mkdir(parents=True, exist_ok=True)
+            r = run(["git", "clone", "--", url, str(path)], timeout=600)
+            if r.returncode != 0:
+                raise CairnError(f"git clone failed: {(r.stderr or r.stdout).strip()}")
+            if (path / "work" / "map.md").exists():
+                raise CairnError(f"{path} already has work/map.md")
+        elif kind == "new":
+            path.mkdir(parents=True, exist_ok=True)
+            if not had_git:
+                r = run(["git", "init"], cwd=path)
+                if r.returncode != 0:
+                    raise CairnError(f"git init failed: {(r.stderr or r.stdout).strip()}")
+
+        notes = str(spec.get("notes") or "").strip()
+        created = ["LEAD.md", "work/map.md"]
+        for d in ("work", "work/tickets", "work/adr", "work/inbox"):
+            refuse_link(d)
+            if not (path / d).is_dir():
+                (path / d).mkdir()
+                dirs.append(path / d)
+        write("work/map.md",
+              f"# {project}\n\n## Destination\n\n{destination}\n\n## Notes\n\n{notes}\n\n"
+              "## Decisions so far\n\n## Not yet specified\n\n## Out of scope\n")
+        # Empty until the lead writes it, so the snapshot says "unknown".
+        write("work/status", "")
+        for i, t in enumerate(tickets, 1):
+            tid = f"{i:02d}"
+            title = str(t["title"]).strip().replace("\n", " ")
+            created.append(f"work/tickets/{tid}-{slugify(title)}.md")
+            write(created[-1],
+                  f"---\nid: {tid}\ntitle: {json.dumps(title, ensure_ascii=False)}\ntype: {t.get('type', 'task')}\n"
+                  f"status: open\nassignee:\nblocked_by: []\n---\n## Question\n\n"
+                  f"{str(t.get('question') or '').strip()}\n")
+        write("LEAD.md", render(template, {
+            "project": project, "destination": destination,
+            "notes": notes or "None."}))
+        for d in ("tickets", "adr", "inbox"):
+            if not any((path / "work" / d).iterdir()):
+                created.append(f"work/{d}/.gitkeep")
+                write(created[-1], "")
+        set_git_identity(path, identity)
+        registered = update_projects(register)
+        git_commit(path, f"cairn: init {project}", created)
+    except BaseException:
+        undo_init(path, existed, had_git, kind, files, dirs, identity)
+        if registered:   # never an older registration of the same project
+            update_projects(lambda data: data.pop(project, None))
+        raise
+    return {"project": project, "path": str(path)}
+
+# ---------- ticket ----------
+
+def one_line(text):
+    return " ".join(str(text).split())
+
+
+def load_ticket_files(repo):
+    """[(id, path, meta, text)] for every readable ticket file."""
+    found = []
+    tdir = repo / "work" / "tickets"
+    for f in sorted(tdir.glob("*.md")) if tdir.is_dir() else []:
+        try:
+            text = read_file(f, errors="strict", whole=True)
+            meta, _ = parse_frontmatter(text)
+        except (OSError, ValueError):
+            continue
+        m = re.match(r"^(\d+)", f.name)
+        tid = str(meta.get("id") or (m.group(1) if m else f.stem))
+        found.append((tid, f, meta, text))
+    return found
+
+
+def next_ticket_id(repo, found):
+    """Highest id in use + 1, counting the NN- prefix of every ticket file,
+    including files whose frontmatter does not parse."""
+    nums = [int(norm_id(tid)) for tid, _, _, _ in found if norm_id(tid).isdigit()]
+    tdir = repo / "work" / "tickets"
+    for f in tdir.glob("*.md") if tdir.is_dir() else []:
+        m = re.match(r"^(\d+)", f.name)
+        if m:
+            nums.append(int(m.group(1)))
+    return f"{(max(nums) if nums else 0) + 1:02d}"
+
+
+@contextlib.contextmanager
+def ticket_lock(repo):
+    """Serialize dashboard ticket ops on one repo (id allocation, write, commit)."""
+    r = run(["git", "rev-parse", "--absolute-git-dir"], cwd=repo)
+    if r.returncode != 0:
+        raise CairnError(f"git rev-parse failed: {(r.stderr or r.stdout).strip()}")
+    fd = os.open(Path(r.stdout.strip()) / "cairn-ticket.lock", os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        deadline = time.monotonic() + TICKET_LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise CairnError("another ticket op is still running; retry in a moment")
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
+def check_no_cycle(found, tid, blocked):
+    """Refuse blocked_by for `tid` if a chain of blockers leads back to it."""
+    edges = {norm_id(t[0]): [norm_id(b) for b in as_list(t[2].get("blocked_by", []))] for t in found}
+    start = norm_id(tid)
+    edges[start] = [norm_id(b) for b in blocked]
+    stack, seen = [[start, b] for b in edges[start]], set()
+    while stack:
+        chain = stack.pop()
+        if chain[-1] == start:
+            shown = (c.zfill(2) if c.isdigit() else c for c in chain)
+            raise CairnError(f"blocked_by would make a cycle: {' -> '.join(shown)}")
+        if chain[-1] in seen:
+            continue
+        seen.add(chain[-1])
+        stack.extend(chain + [b] for b in edges.get(chain[-1], []))
+
+
+def check_blockers(value, known, self_id=None):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise CairnError("blocked_by must be a list of ticket ids")
+    ids = [str(v).strip() for v in value]
+    for b in ids:
+        if norm_id(b) not in known:
+            raise CairnError(f"unknown blocker ticket: {b}")
+        if self_id is not None and norm_id(b) == norm_id(self_id):
+            raise CairnError("a ticket cannot block itself")
+    return ids
+
+
+def need_text(op, key):
+    value = op.get(key)
+    if not isinstance(value, str) or not one_line(value):
+        raise CairnError(f"{key} is required")
+    return value.strip()
+
+
+def open_unclaimed(found, tid):
+    want = norm_id(tid)
+    for t in found:
+        if norm_id(t[0]) == want:
+            _, path, meta, text = t
+            title = str(meta.get("title") or path.stem)
+            if str(meta.get("status", "")).lower() == "closed":
+                raise CairnError(f"ticket {t[0]} is closed")
+            if str(meta.get("assignee") or "").strip():
+                raise CairnError(f"ticket {t[0]} is claimed by {meta.get('assignee')}")
+            return t[0], path, title, text
+    raise CairnError(f"unknown ticket: {tid}")
+
+
+def set_frontmatter(text, key, value):
+    lines = text.replace("\r\n", "\n").split("\n")
+    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+    if not lines or lines[0].strip() != "---" or end is None:
+        raise CairnError("ticket has no frontmatter")
+    line = f"{key}: {value}".rstrip()
+    for i in range(1, end):
+        if re.match(rf"^{key}\s*:", lines[i]):
+            # a block-style list continues on indented "- x" lines
+            j = i + 1
+            while j < end and re.match(r"^\s*-(\s|$)", lines[j]):
+                j += 1
+            lines[i:j] = [line]
+            return "\n".join(lines)
+    lines.insert(end, line)
+    return "\n".join(lines)
+
+
+def add_map_line(text, heading, line):
+    """Append `line` to the end of the `## heading` section, creating it if absent."""
+    lines = text.replace("\r\n", "\n").rstrip("\n").split("\n")
+    start = next((i for i, l in enumerate(lines)
+                  if re.match(r"^##\s+(.*?)\s*$", l)
+                  and re.match(r"^##\s+(.*?)\s*$", l).group(1).lower() == heading.lower()), None)
+    if start is None:
+        return "\n".join(lines + ["", f"## {heading}", "", line]) + "\n"
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+    last = start
+    for i in range(start + 1, end):
+        if lines[i].strip():
+            last = i
+    if last == start:
+        lines[start + 1:end] = ["", line] + ([""] if end < len(lines) else [])
+    else:
+        lines.insert(last + 1, line)
+    return "\n".join(lines) + "\n"
+
+
+def head_holds(repo, rel):
+    """True when HEAD has exactly the working-tree content of `rel` (or both lack it)."""
+    r = run(["git", "rev-parse", "-q", "--verify", f"HEAD:{rel}"], cwd=repo)
+    in_head = r.stdout.strip() if r.returncode == 0 else None
+    if not (repo / rel).exists():
+        return in_head is None
+    r = run(["git", "hash-object", "--", rel], cwd=repo)
+    return r.returncode == 0 and r.stdout.strip() == in_head
+
+
+def git_commit(repo, message, paths):
+    """Stage and commit only `paths`, without the repo's hooks or signing (a slow hook would outlast the timeout);
+    staged changes elsewhere stay staged. `git commit -- <paths>` builds the commit from HEAD plus just those paths.
+    A failed commit still succeeds when HEAD already holds every path, which
+    is what happens when a lead commit takes the files first."""
+    env = dict(os.environ, GIT_AUTHOR_NAME=DASHBOARD_IDENTITY[0], GIT_AUTHOR_EMAIL=DASHBOARD_IDENTITY[1],
+               GIT_COMMITTER_NAME=DASHBOARD_IDENTITY[0], GIT_COMMITTER_EMAIL=DASHBOARD_IDENTITY[1])
+    tries = int(os.environ.get("CAIRN_LOCK_TRIES", LOCK_TRIES))
+    delay = float(os.environ.get("CAIRN_LOCK_DELAY", LOCK_DELAY))
+    commit = ["-c", "commit.gpgsign=false", "commit", "--no-verify"]
+    try:
+        for name, step in (("add", ["add", "--"]), ("commit", [*commit, "-m", message, "--"])):
+            for attempt in range(tries):
+                r = run(["git", *step, *paths], cwd=repo, env=env)
+                if r.returncode == 0:
+                    break
+                err = (r.stderr or r.stdout).strip()
+                if not any(m in err for m in LOCK_ERRORS) or attempt == tries - 1:
+                    raise CairnError(f"git {name} failed: {err}")
+                time.sleep(delay)
+    except CairnError:
+        if not all(head_holds(repo, p) for p in paths):
+            raise
+    r = run(["git", "rev-parse", "--short", "HEAD"], cwd=repo)
+    if r.returncode != 0:
+        raise CairnError(f"git rev-parse failed: {(r.stderr or r.stdout).strip()}")
+    return r.stdout.strip()
+
+
+def cmd_ticket(args):
+    if len(args) != 1:
+        raise CairnError("usage: ticket <project>")
+    repo = project_path(args[0])
+    try:
+        op = json.loads(sys.stdin.read())
+    except ValueError as e:
+        raise CairnError(f"ticket op is not valid JSON: {e}")
+    if not isinstance(op, dict):
+        raise CairnError("ticket op must be a JSON object")
+    name = op.get("op")
+    if name not in ("create", "close", "out-of-scope", "blockers"):
+        raise CairnError("op must be create, close, out-of-scope or blockers")
+    if not (repo / ".git").exists():
+        raise CairnError(f"{repo} is not a git repo")
+    with ticket_lock(repo):
+        return apply_ticket_op(repo, name, op)
+
+
+def apply_ticket_op(repo, name, op):
+    found = load_ticket_files(repo)
+    known = {norm_id(t[0]) for t in found}
+    writes = {}  # path -> new text
+    mappath = repo / "work" / "map.md"
+
+    if name == "create":
+        title = one_line(need_text(op, "title"))
+        ttype = op.get("type")
+        if ttype not in TICKET_TYPES:
+            raise CairnError(f"type must be one of {', '.join(TICKET_TYPES)}")
+        question = op.get("question")
+        if not isinstance(question, str):
+            raise CairnError("question is required")
+        blocked = check_blockers(op.get("blocked_by"), known)
+        tid = next_ticket_id(repo, found)
+        check_no_cycle(found, tid, blocked)
+        path = repo / "work" / "tickets" / f"{tid}-{slugify(title)}.md"
+        if path.exists():
+            raise CairnError(f"{path.relative_to(repo)} already exists")
+        writes[path] = (f"---\nid: {tid}\ntitle: {json.dumps(title, ensure_ascii=False)}\ntype: {ttype}\n"
+                        f"status: open\nassignee:\nblocked_by: [{', '.join(blocked)}]\n---\n## Question\n\n"
+                        f"{question.strip()}\n")
+    elif name in ("close", "out-of-scope"):
+        key = "resolution" if name == "close" else "reason"
+        if "id" not in op:
+            raise CairnError("id is required")
+        text_in = need_text(op, key)
+        tid, path, title, text = open_unclaimed(found, op["id"])
+        # The lead also writes the map; never commit its unfinished edits.
+        if not head_holds(repo, "work/map.md"):
+            raise CairnError("work/map.md has uncommitted changes from the lead; retry in a moment")
+        body = text_in if name == "close" else f"Out of scope: {text_in}"
+        new = set_frontmatter(text, "status", "closed").rstrip("\n") + f"\n\n## Resolution\n\n{body}\n"
+        writes[path] = new
+        mtext = read_file(mappath, errors="strict", whole=True) if mappath.exists() else ""
+        heading = "Decisions so far" if name == "close" else "Out of scope"
+        writes[mappath] = add_map_line(
+            mtext, heading, f"- [{title}](tickets/{path.name}) — {one_line(text_in)}")
+    else:
+        if "id" not in op:
+            raise CairnError("id is required")
+        tid, path, title, text = open_unclaimed(found, op["id"])
+        if "blocked_by" not in op:
+            raise CairnError("blocked_by is required")
+        blocked = check_blockers(op["blocked_by"], known, tid)
+        check_no_cycle(found, tid, blocked)
+        writes[path] = set_frontmatter(text, "blocked_by", f"[{', '.join(blocked)}]")
+
+    # read_file refuses a symlink, so a write below never lands outside the repo
+    before = {p: (read_file(p, errors="strict", whole=True) if p.exists() else None) for p in writes}
+    rels = [str(p.relative_to(repo)) for p in writes]
+    try:
+        for p, t in writes.items():
+            try:
+                with open(p, "x" if before[p] is None else "w") as fh:
+                    fh.write(t)
+            except FileExistsError:
+                raise CairnError(f"{p.relative_to(repo)} already exists")
+        sha = git_commit(repo, f"cairn: {name} ticket {tid}", rels)
+    except BaseException:   # also an OSError, such as a read-only work/map.md
+        # Undo only our own uncommitted writes: never touch a path whose
+        # content HEAD already holds or that someone else has since changed.
+        undone = []
+        for p, old in before.items():
+            rel = str(p.relative_to(repo))
+            if not p.exists() or p.read_text() != writes[p] or head_holds(repo, rel):
+                continue
+            if old is None:
+                p.unlink()
+            else:
+                p.write_text(old)
+            undone.append(rel)
+        if undone:
+            run(["git", "reset", "-q", "--", *undone], cwd=repo)
+        raise
+    ticket_path = next(p for p in writes if p != mappath)
+    return {"id": tid, "path": str(ticket_path.relative_to(repo)), "commit": sha}
+
+
+# ---------- start / stop / review / pane ----------
+
+def load_session_id(project):
+    try:
+        data = json.loads(marker(project).read_text())
+        return str(uuid.UUID(str(data["session_id"])))
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def transcript_saved(sid):
+    """Whether claude still has conversation `sid` (~/.claude/projects/<folder>/<sid>.jsonl)."""
+    return any((home() / ".claude" / "projects").glob(f"*/{sid}.jsonl"))
+
+
+def take_models(args):
+    """Strip --model and --subagent-model from args; each value must be one of MODELS."""
+    rest, found = list(args), {}
+    for flag in ("--model", "--subagent-model"):
+        if flag in rest:
+            i = rest.index(flag)
+            if i + 1 >= len(rest) or rest[i + 1] not in MODELS:
+                raise CairnError(f"{flag} must be one of {', '.join(MODELS)}")
+            found[flag] = rest[i + 1]
+            del rest[i:i + 2]
+    return rest, found.get("--model"), found.get("--subagent-model")
+
+
+def cmd_start(args):
+    rest, model, subagent_model = take_models(args)
+    if len(rest) != 1:
+        raise CairnError("usage: start <project> [--model A] [--subagent-model A]")
+    project = rest[0]
+    path = project_path(project)
+    token = read_token()
+    if session_alive(project):
+        raise CairnError(f"session {project} is already running")
+    sid = load_session_id(project)
+    if sid and not transcript_saved(sid):   # claude --resume of a conversation it no longer has exits at once
+        sid = None
+    resumed = sid is not None
+    cargs = ["--model", model] if model else []
+    if resumed:
+        cargs += ["--resume", sid]
+    else:
+        sid = str(uuid.uuid4())
+        cargs += ["--session-id", sid]
+    try:
+        before = marker(project).read_text()
+    except OSError:
+        before = None
+
+    def started():
+        marker(project).parent.mkdir(parents=True, exist_ok=True)
+        marker(project).write_text(json.dumps({"session_id": sid, "started_at": now_iso()}) + "\n")
+
+    try:
+        new_session(project, path, token, cargs, CONTINUE_PROMPT if resumed else START_PROMPT, subagent_model, started)
+    except BaseException:
+        if session_alive(project) is False:   # no lead runs: keep the marker of the last one that did
+            if before is None:
+                marker(project).unlink(missing_ok=True)
+            else:
+                marker(project).write_text(before)
+        raise
+    return {"session": project, "resumed": resumed, "session_id": sid}
+
+
+def cmd_stop(args):
+    if len(args) != 1:
+        raise CairnError("usage: stop <project>")
+    project_path(args[0])
+    if session_alive(args[0]) is False:
+        return {"stopped": False}
+    r = tmux("kill-session", "-t", f"={args[0]}")
+    if r.returncode != 0:
+        if session_alive(args[0]) is False:   # the lead ended its own session in between
+            return {"stopped": False}
+        raise CairnError(f"tmux kill-session failed: {(r.stderr or '').strip()}")
+    try:   # a deliberate stop, so the hub does not report "stopped while working"; start rewrites the marker
+        data = json.loads(marker(args[0]).read_text())
+        marker(args[0]).write_text(json.dumps(dict(data, stopped=True)) + "\n")
+    except (OSError, ValueError):
+        pass
+    return {"stopped": True}
+
+
+def cmd_review(args):
+    if len(args) != 1:
+        raise CairnError("usage: review <project>")
+    project = args[0]
+    path = project_path(project)
+    token = read_token()
+    name = project + REVIEW_SUFFIX
+    if not session_alive(name):
+        new_session(name, path, token, ["--session-id", str(uuid.uuid4())], REVIEW_PROMPT)
+    return {"session": name, "attach": f"tmux -L cairn attach -t {name}"}
+
+
+def read_token_fd():
+    """The token line, read byte by byte from fd 0 so the rest of stdin stays for claude."""
+    buf = bytearray()
+    while len(buf) < 16384:
+        b = os.read(0, 1)
+        if not b or b == b"\n":
+            break
+        buf += b
+    token = buf.decode(errors="replace").strip()
+    if any(c.isspace() for c in token):
+        raise CairnError("token must not contain whitespace")
+    return token
+
+
+def review_marker(project):
+    return cairn_home() / "state" / f"{project}.review.json"
+
+
+def cmd_chat(args):
+    rest, model, subagent_model = take_models(args)
+    resume = "--resume" in rest
+    rest = [a for a in rest if a != "--resume"]
+    if len(rest) != 1:
+        raise CairnError("usage: chat <project> [--resume] [--model A] [--subagent-model A]")
+    project = rest[0]
+    path = project_path(project)
+    token = read_token_fd()
+    claude = resolve_claude()
+    if not claude:
+        raise CairnError("claude not found on PATH or in ~/.local/bin")
+    trust_project(path)
+    sid = None
+    if resume:
+        try:
+            sid = str(uuid.UUID(str(json.loads(review_marker(project).read_text())["session_id"])))
+        except (OSError, ValueError, TypeError, KeyError):
+            sid = None
+        # The marker is written before claude runs; resume only a conversation claude saved.
+        if sid and not transcript_saved(sid):
+            sid = None
+    resumed = sid is not None
+    if not resumed:
+        sid = str(uuid.uuid4())
+        review_marker(project).parent.mkdir(parents=True, exist_ok=True)
+        review_marker(project).write_text(json.dumps({"session_id": sid, "started_at": now_iso()}) + "\n")
+    env = {k: v for k, v in os.environ.items() if k not in (TOKEN_VAR, SUBAGENT_VAR)}
+    if token:
+        env[TOKEN_VAR] = token
+    if subagent_model:
+        env[SUBAGENT_VAR] = subagent_model
+    argv = [claude, "-p", "--input-format", "stream-json", "--output-format", "stream-json",
+            "--verbose", "--dangerously-skip-permissions", *(["--model", model] if model else []),
+            "--resume" if resumed else "--session-id", sid]
+    sys.stdout.write(json.dumps({"type": "cairn", "session_id": sid, "resumed": resumed}) + "\n")
+    sys.stdout.flush()
+    os.chdir(path)
+    os.execve(claude, argv, env)
+
+
+def cmd_answer(args):
+    if len(args) != 1:
+        raise CairnError("usage: answer <project>  (stdin: {\"id\", \"choice\", \"note\", \"fingerprint\"})")
+    path = project_path(args[0])
+    try:
+        op = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        raise CairnError("stdin is not JSON")
+    if not isinstance(op, dict):
+        raise CairnError("stdin must be a JSON object")
+    qid, choice, note, fingerprint = op.get("id"), op.get("choice"), op.get("note") or "", op.get("fingerprint")
+    if not isinstance(qid, str) or not re.fullmatch(r"q\d+", qid):
+        raise CairnError(f"invalid question id: {qid!r}")
+    if not isinstance(note, str) or len(note) > 4000:
+        raise CairnError("note must be text of at most 4000 characters")
+    if fingerprint is not None and not isinstance(fingerprint, str):
+        raise CairnError("fingerprint must be text")
+    question = next((q for q in read_questions(path, [], args[0]) if q["id"] == qid), None)
+    if question is None:
+        raise CairnError(f"unknown question: {qid}")
+    if fingerprint is not None and fingerprint != question["fingerprint"]:   # absent from older hubs
+        raise CairnError(f"{qid} changed since it was shown; read it again", question=question)
+    if question["answered"]:
+        raise CairnError(f"{qid} is already answered")
+    letters = [OPTION_RE.match(o).group(1) for o in question["options"]]
+    if choice == "other":
+        if not note.strip():
+            raise CairnError("choice other needs a note")
+    elif choice not in letters:
+        raise CairnError(f"choice must be one of {', '.join(letters + ['other'])}")
+    at = now_iso()
+    rel = f"work/inbox/{Path(question['path']).stem}.answer.md"
+    text = f"---\nid: {qid}\nchoice: {choice}\nanswered_at: {at}\n---\n{note.strip()}\n"
+    try:
+        fd = os.open(path / rel, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        raise CairnError(f"{qid} is already answered")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    return {"id": qid, "choice": choice, "answered_at": at, "path": rel}
+
+
+def cmd_pane(args):
+    review = "--review" in args
+    rest = [a for a in args if a != "--review"]
+    if len(rest) != 1:
+        raise CairnError("usage: pane <project> [--review]")
+    project_path(rest[0])
+    name = rest[0] + REVIEW_SUFFIX if review else rest[0]
+    if session_alive(name) is False:
+        raise CairnError(f"no session {name}")
+    lines = pane_lines(name)
+    if lines is None:
+        raise CairnError(f"tmux capture-pane failed for {name}")
+    return {"lines": lines}
+
+
+ANSWER_HOLD = 15   # seconds; Claude Code may still show a dialog it took, and a second Enter would answer the next one
+KEY_GAP = 0.15   # one send-keys per key, spaced, so Claude Code never sees a burst it might read as one input
+MOVE_WAIT = 1.5
+
+
+def lead_dialog(project):
+    project_path(project)
+    if session_alive(project) is False:
+        raise CairnError(f"no session {project}")
+    lines = pane_lines(project, DIALOG_LINES)
+    if lines is None:
+        raise CairnError(f"tmux capture-pane failed for {project}")
+    return read_dialog(lines)
+
+
+def send_key(project, key):
+    if tmux("send-keys", "-t", f"={project}:", key).returncode != 0:
+        raise CairnError(f"tmux send-keys failed for {project}")
+
+
+def wait_dialog(project, seconds, done, gone_ok=False):
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            dialog = lead_dialog(project)
+        except CairnError:
+            if gone_ok and session_alive(project) is False:
+                return None
+            raise
+        if done(dialog) or time.monotonic() >= deadline:
+            return dialog
+        time.sleep(0.2)
+
+
+@contextlib.contextmanager
+def dialog_lock(project):
+    """One answer per lead at a time. The file also records the last answered dialog text and when."""
+    path = cairn_home() / "state" / f"{project}.dialog.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise CairnError("another answer to this dialog is being sent; read it again", dialog=lead_dialog(project))
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def dialog_text(dialog):
+    """The dialog without its ❯ marker: the same text whichever option is selected."""
+    return hashlib.sha256("\n".join(l.replace("❯", " ") for l in steady(dialog["lines"])).encode()).hexdigest()
+
+
+def cmd_dialog(args):
+    if len(args) != 1:
+        raise CairnError("usage: dialog <project>")
+    return {"dialog": lead_dialog(args[0])}
+
+
+def cmd_dialog_answer(args):
+    """Pick option n of the lead's dialog, only while the pane shows exactly the dialog with that fingerprint.
+    The ❯ marker is moved with Up/Down and checked before Enter; number keys are never sent."""
+    if len(args) != 3 or not re.fullmatch(r"[0-9a-f]{64}", args[1]) or not args[2].isdigit():
+        raise CairnError("usage: dialog-answer <project> <fingerprint> <n>")
+    project, fingerprint, n = args[0], args[1], int(args[2])
+    project_path(project)
+    with dialog_lock(project) as fd:
+        dialog = lead_dialog(project)
+        if dialog is None or dialog["fingerprint"] != fingerprint:
+            raise CairnError("the dialog changed; read it again", dialog=dialog)
+        option = next((o for o in dialog["options"] if o["n"] == n), None)
+        if option is None:
+            raise CairnError(f"option {n} is not one of the dialog's options", dialog=dialog)
+        try:
+            last = json.loads(os.pread(fd, 4096, 0) or b"{}")
+        except ValueError:
+            last = {}
+        text = dialog_text(dialog)
+        if last.get("text") == text and time.time() - last.get("at", 0) < ANSWER_HOLD:
+            raise CairnError("this dialog was answered moments ago; read it again in a few seconds", dialog=dialog)
+        key = "Down" if n > dialog["selected"] else "Up"
+        for _ in range(abs(n - dialog["selected"])):
+            send_key(project, key)
+            time.sleep(KEY_GAP)
+        same = lambda d: d is not None and dialog_text(d) == text
+        moved = wait_dialog(project, MOVE_WAIT, lambda d: not same(d) or d["selected"] == n)
+        if not same(moved) or moved["selected"] != n:
+            raise CairnError(f"the selection did not reach option {n}; nothing was confirmed", dialog=moved)
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, json.dumps({"text": text, "at": time.time()}).encode(), 0)
+        send_key(project, "Enter")
+        wait = float(os.environ.get("CAIRN_DIALOG_WAIT", 3))
+        after = wait_dialog(project, wait, lambda d: d is None or d["fingerprint"] != moved["fingerprint"], gone_ok=True)
+    return {"answered": n, "label": option["label"], "dialog": after}
+
+
+# ---------- relead / usage ----------
+
+def lead_section(text, heading, until):
+    """The text under `## <heading>` up to the template's next heading `## <until>` (so notes may hold their own
+    `## ` headings); None when either heading is missing."""
+    m = re.search(rf"^## {heading}[ \t]*\n(.*?)^## {until}[ \t]*$", text, re.M | re.S)
+    return m.group(1).strip() if m else None
+
+
+def headings(text):
+    return [l[3:].strip() for l in text.splitlines() if l.startswith("## ")]
+
+
+def cmd_relead(args):
+    """Re-render LEAD.md from the current template, keeping the destination and notes."""
+    if len(args) != 1:
+        raise CairnError("usage: relead <project>")
+    project = args[0]
+    repo = project_path(project)
+    try:
+        current = read_file(repo / "LEAD.md", errors="strict", whole=True)
+    except (OSError, ValueError) as e:
+        raise CairnError(f"cannot read LEAD.md: {e}")
+    destination, notes = lead_section(current, "Destination", "Notes"), lead_section(current, "Notes", "Files")
+    if destination is None or notes is None:
+        raise CairnError("LEAD.md has no ## Destination, ## Notes or ## Files heading; edit it by hand")
+    template = find_template().read_text()
+    version = template_version() or 1
+    new = render(template, {"project": project, "destination": destination, "notes": notes or "None."})
+    known = set(headings(new))
+    kept = current[current.index("## Destination"):current.index("## Files")]
+    dropped = [h for h in headings(current) if h not in known and h not in headings(kept)]
+    (repo / "LEAD.md").write_text(new)
+    try:
+        sha = git_commit(repo, f"cairn: update LEAD.md to v{version}", ["LEAD.md"])
+    except BaseException:
+        (repo / "LEAD.md").write_text(current)
+        run(["git", "reset", "-q", "--", "LEAD.md"], cwd=repo)
+        raise
+    return {"version": version, "commit": sha, "dropped": dropped}
+
+
+ACTIVE_GAP = 300  # seconds; longer gaps between transcript entries are not active time
+
+
+def parse_ts(text):
+    try:
+        return datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def usage_of_file(path):
+    """{"messages": {id: [model, input, output, cache_read, cache_write]}, "times": [ISO, ...]} for one transcript."""
+    messages, times = {}, []
+    with open(path, errors="replace") as f:
+        for line in f:
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(m, dict):
+                continue
+            if isinstance(m.get("timestamp"), str):
+                times.append(m["timestamp"])
+            msg = m.get("message") if m.get("type") == "assistant" else None
+            if not isinstance(msg, dict) or not isinstance(msg.get("usage"), dict) or msg.get("model") in (None, "<synthetic>"):
+                continue
+            u = msg["usage"]
+            try:
+                counts = [int(u.get(k) or 0) for k in
+                          ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")]
+            except (TypeError, ValueError):
+                continue
+            messages[str(msg.get("id") or "%s:%d" % (path, len(messages)))] = [str(msg["model"]), *counts]
+    return {"messages": messages, "times": times}
+
+
+def cached_usage(entry, stamp):
+    """True when a cache entry is for this stamp and has the shape usage_of_file returns."""
+    if not isinstance(entry, dict) or entry.get("stamp") != stamp:
+        return False
+    rows, times = entry.get("messages"), entry.get("times")
+    return (isinstance(rows, dict) and isinstance(times, list) and all(isinstance(t, str) for t in times)
+            and all(isinstance(r, list) and len(r) == 5 and isinstance(r[0], str)
+                    and all(type(v) is int for v in r[1:]) for r in rows.values()))
+
+
+def cmd_usage(args):
+    if len(args) != 1:
+        raise CairnError("usage: usage <project>")
+    project = args[0]
+    repo = project_path(project)
+    # Claude Code names the folder after its real working directory; try the registered path too
+    roots = list(dict.fromkeys(home() / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(p))
+                               for p in (repo, repo.resolve())))
+    cache_path = cairn_home() / "state" / f"usage-{project}.json"
+    try:
+        cache = json.loads(cache_path.read_text())
+    except (OSError, ValueError):
+        cache = {}
+    if not isinstance(cache, dict):
+        cache = {}
+    fresh, messages, times, sessions = {}, {}, [], 0
+    paths = [(root, p) for root in roots if root.is_dir() for p in sorted(root.rglob("*.jsonl"))]
+    for root, path in paths:
+        key = str(path.relative_to(root.parent))
+        try:   # a transcript can go between the listing and its read
+            st = path.stat()
+            stamp = [st.st_size, st.st_mtime]
+            entry = cache.get(key)
+            if not cached_usage(entry, stamp):
+                entry = {"stamp": stamp, **usage_of_file(path)}
+        except OSError:
+            continue
+        fresh[key] = entry
+        sessions += path.parent in roots
+        messages.update(entry["messages"])
+        times += entry["times"]
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(fresh))
+    os.replace(tmp, cache_path)
+    models = {}
+    for model, *counts in messages.values():
+        row = models.setdefault(model, {"model": model, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "messages": 0})
+        for k, v in zip(("input", "output", "cache_read", "cache_write"), counts):
+            row[k] += v
+        row["messages"] += 1
+    stamps = sorted(t for t in (parse_ts(x) for x in times) if t is not None)
+    active = sum(b - a for a, b in zip(stamps, stamps[1:]) if b - a < ACTIVE_GAP)
+    by_time = sorted(times, key=lambda x: parse_ts(x) or 0)
+    return {"models": sorted(models.values(), key=lambda r: -r["output"]), "sessions": sessions,
+            "first_at": by_time[0] if by_time else None, "last_at": by_time[-1] if by_time else None,
+            "active_minutes": int(active // 60), "files": len(fresh)}
+
+
+COMMANDS = {"snapshot": cmd_snapshot, "read": cmd_read, "init": cmd_init,
+            "start": cmd_start, "stop": cmd_stop, "review": cmd_review, "pane": cmd_pane,
+            "ticket": cmd_ticket, "chat": cmd_chat, "answer": cmd_answer,
+            "relead": cmd_relead, "usage": cmd_usage, "dialog": cmd_dialog, "dialog-answer": cmd_dialog_answer}
+
+
+def main(argv):
+    # the registry, session ids and usage are nobody else's business; git, tmux and claude inherit this too
+    os.umask(0o077)
+    try:
+        if not argv or argv[0] not in COMMANDS:
+            raise CairnError("usage: cairn-node " + "|".join(COMMANDS))
+        result = COMMANDS[argv[0]](argv[1:])
+    except CairnError as e:
+        print(json.dumps({"error": str(e), **e.extra}))
+        return 1
+    except Exception as e:
+        print(json.dumps({"error": f"{type(e).__name__}: {e}"}))
+        return 1
+    print(json.dumps(result))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

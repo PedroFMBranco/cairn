@@ -1,0 +1,9 @@
+Downloaded 2026-10-17 from cdn.jsdelivr.net; source maps lines removed. No other edits.
+preact@10.29.8      dist/preact.module.js        -> preact.module.js
+preact@10.29.8      hooks/dist/hooks.module.js   -> hooks.module.js
+htm@3.1.1           dist/htm.module.js           -> htm.module.js
+marked@18.0.14      lib/marked.esm.js            -> marked.esm.js
+b1d3259c155bf0ae927d69dd7d0053db272db9c507ece0ac06a536fefd8c307c  hooks.module.js
+ab33dd3f38059b9be4d5f5350128eefb2356639c4e0bbe9d9e8b3ba75847e9e4  htm.module.js
+0eab1f03c00471183d1b79febacfdca34e3f4bf506d25720883c682780f9e5e1  marked.esm.js
+25a5df7e9f628a587743c4641a368737a3b218f28ef738ba0376a2d5bdfc948c  preact.module.js

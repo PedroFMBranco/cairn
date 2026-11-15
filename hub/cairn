@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+# 3.11.4 brings tarfile's data filter and a fromisoformat that reads "...Z"; keep this file parseable by older Pythons
+if sys.version_info < (3, 11, 4):
+    sys.stderr.write("cairn: needs Python 3.11.4 or newer; %s is %s. Run it with a newer python3, "
+                     "e.g. Homebrew's: brew install python\n" % (sys.executable, sys.version.split()[0]))
+    sys.exit(1)
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from cairn_hub.cli import main
+
+sys.exit(main())

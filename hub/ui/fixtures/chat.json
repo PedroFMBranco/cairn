@@ -1,0 +1,106 @@
+{
+  "chats": [
+    {
+      "node": "box-1",
+      "project": "isbn-check",
+      "state": "ended",
+      "detail": "idle",
+      "session_id": "5b0e2c4a-7d1f-4e8b-9a36-2f1c8d7e4b90",
+      "started_at": "2026-10-17T09:20:01Z",
+      "events": [
+        {
+          "seq": 1,
+          "at": "2026-10-17T09:20:01Z",
+          "kind": "state",
+          "state": "starting",
+          "detail": null
+        },
+        {
+          "seq": 2,
+          "at": "2026-10-17T09:20:03Z",
+          "kind": "state",
+          "state": "working",
+          "detail": null
+        },
+        {
+          "seq": 3,
+          "at": "2026-10-17T09:20:04Z",
+          "kind": "tool",
+          "name": "Bash",
+          "summary": "ls work/inbox"
+        },
+        {
+          "seq": 4,
+          "at": "2026-10-17T09:20:05Z",
+          "kind": "tool",
+          "name": "Read",
+          "summary": "work/inbox/q03.md"
+        },
+        {
+          "seq": 5,
+          "at": "2026-10-17T09:20:08Z",
+          "kind": "text",
+          "text": "1 open question."
+        },
+        {
+          "seq": 6,
+          "at": "2026-10-17T09:20:08Z",
+          "kind": "text",
+          "text": "**q03**, on *set the source weights*. The publisher feed matched 64% of the 2025 corrections; past corrections matched 22%.\n\nA. Weight the feed 0.6, the export 0.3, past corrections 0.1 (recommended: mirrors the 2025 hit rates)\nB. Equal weights until the backtest runs\nC. Feed only for now\n\nGate: no. If you skip it, the lead already applies A.\nReply: a letter, y = take the recommendation, later = skip, or your own text."
+        },
+        {
+          "seq": 7,
+          "at": "2026-10-17T09:20:08Z",
+          "kind": "turn",
+          "ok": true,
+          "seconds": 6.4,
+          "cost_usd": 0.021
+        },
+        {
+          "seq": 8,
+          "at": "2026-10-17T09:20:08Z",
+          "kind": "state",
+          "state": "waiting",
+          "detail": null
+        },
+        {
+          "seq": 9,
+          "at": "2026-10-17T09:40:08Z",
+          "kind": "state",
+          "state": "ended",
+          "detail": "idle"
+        }
+      ]
+    }
+  ],
+  "why": {
+    "box-1/tile-cache": {
+      "q10": {
+        "tools": [
+          [
+            "Read",
+            "work/tickets/06-eviction-test.md"
+          ],
+          [
+            "Bash",
+            "psql -h db -Atc \"select pg_size_pretty(pg_database_size('tiles_shared'))\""
+          ]
+        ],
+        "text": "The test fills the disk until the cache evicts, and eviction deletes tiles. `tiles_shared` is 41 GB and holds the 308-district full-region batch that the live map stack reads, so B risks the one volume that must never be dropped, night window or not.\n\nA copies it to a scratch database first (about 25 minutes on box-1), and the test deletes only there. C is safe but one district is about 140 MB, which never fills the disk, so eviction would not trigger at all."
+      },
+      "q09": {
+        "tools": [
+          [
+            "Read",
+            "work/tickets/04-invalidation.md"
+          ],
+          [
+            "Bash",
+            "python3 -m tilecache.bench_invalidate --tiles 40000 --mode inline,queued,drop"
+          ]
+        ],
+        "text": "C drops the whole zoom band, so every pan after a large batch is a cold read until the band refills: at zoom 14 that is back to the 640 ms baseline for about 50 s. The bench on 40,000 tiles:\n\n| mode | commit | stale tiles |\n|---|---|---|\n| inline (A) | 9.8 s | none |\n| queued (B) | 1.4 s | up to 48 s |\n| drop band (C) | 0.3 s | none, but cold cache |\n\nB keeps commits fast and only leaves stale tiles for under a minute."
+      }
+    }
+  }
+}

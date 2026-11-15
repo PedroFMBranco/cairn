@@ -1,0 +1,1152 @@
+{
+  "synced_at": "2026-10-17T10:30:00Z",
+  "nodes": [
+    {
+      "name": "box-1",
+      "ssh": "agent@192.0.2.10",
+      "node_version": "0.1.0",
+      "update_available": true,
+      "port": 2222,
+      "allowed_tokens": [
+        "main-max",
+        "team-seat",
+        "second-pro"
+      ],
+      "ok": true,
+      "error": null,
+      "synced_at": "2026-10-17T10:30:00Z",
+      "snapshot": {
+        "node_version": "0.1.0",
+        "host": "box-1",
+        "lead_template_version": 2,
+        "time": "2026-10-17T10:29:59Z",
+        "free_ram_mb": 2810,
+        "free_disk_mb": 41250,
+        "deps": {
+          "tmux": "3.3a",
+          "git": "2.39.5",
+          "python3": "3.11.2",
+          "claude": "2.1.296"
+        },
+        "warnings": [
+          {
+            "warning": "tile-cache: work/tickets/11-draft.md has no frontmatter, skipped"
+          }
+        ],
+        "projects": [
+          {
+            "name": "tile-cache",
+            "path": "/home/agent/work/tile-cache",
+            "status": "working 07",
+            "lead": "alive",
+            "review": "none",
+            "pane_last": "You've hit your session limit · resets in 2h",
+            "lead_state": "limit",
+            "lead_note": "You've hit your session limit · resets in 2h",
+            "lead_version": 2,
+            "result": null,
+            "map": {
+              "destination": "Serve map tiles from a precomputed cache so the full-region batch (308 districts) pans under 200 ms at zoom 14 on a mid-range laptop.",
+              "decisions": [
+                "- [Cache by tile, not by district](tickets/02-cache-unit.md) — tile keys survive boundary edits",
+                "- [Store tiles in MBTiles, one file per zoom band](adr/0001-mbtiles-per-zoom-band.md) — one file copies faster than 2 million small ones",
+                "- [Baseline is 640 ms median pan at zoom 14](tickets/01-baseline-latency.md) — measured on the live stack, 3 runs"
+              ]
+            },
+            "tickets": [
+              {
+                "id": "01",
+                "title": "Measure current pan latency at zoom 12 to 16",
+                "type": "research",
+                "status": "closed",
+                "assignee": "lead",
+                "blocked_by": [],
+                "state": "closed",
+                "path": "work/tickets/01-baseline-latency.md"
+              },
+              {
+                "id": "02",
+                "title": "Choose the cache unit",
+                "type": "grilling",
+                "status": "closed",
+                "assignee": "lead",
+                "blocked_by": [
+                  "01"
+                ],
+                "state": "closed",
+                "path": "work/tickets/02-cache-unit.md"
+              },
+              {
+                "id": "03",
+                "title": "Prototype an MBTiles writer for one district",
+                "type": "prototype",
+                "status": "closed",
+                "assignee": "lead",
+                "blocked_by": [
+                  "02"
+                ],
+                "state": "closed",
+                "path": "work/tickets/03-mbtiles-prototype.md"
+              },
+              {
+                "id": "04",
+                "title": "Decide when the cache is invalidated",
+                "type": "research",
+                "status": "open",
+                "assignee": "",
+                "blocked_by": [
+                  "02"
+                ],
+                "state": "waiting",
+                "path": "work/tickets/04-invalidation.md"
+              },
+              {
+                "id": "05",
+                "title": "Backfill script for all 308 districts",
+                "type": "task",
+                "status": "open",
+                "assignee": "",
+                "blocked_by": [
+                  "07"
+                ],
+                "state": "blocked",
+                "path": "work/tickets/05-backfill.md"
+              },
+              {
+                "id": "06",
+                "title": "Test eviction under disk pressure",
+                "type": "prototype",
+                "status": "open",
+                "assignee": "",
+                "blocked_by": [],
+                "state": "waiting",
+                "path": "work/tickets/06-eviction-test.md"
+              },
+              {
+                "id": "07",
+                "title": "Build the tile cache writer",
+                "type": "build",
+                "status": "open",
+                "assignee": "lead",
+                "blocked_by": [
+                  "03"
+                ],
+                "state": "waiting",
+                "path": "work/tickets/07-cache-writer.md"
+              },
+              {
+                "id": "08",
+                "title": "Benchmark cached pan against the baseline",
+                "type": "task",
+                "status": "open",
+                "assignee": "",
+                "blocked_by": [
+                  "05",
+                  "07"
+                ],
+                "state": "blocked",
+                "path": "work/tickets/08-benchmark.md"
+              },
+              {
+                "id": "09",
+                "title": "Expose cache hit rate on the stats endpoint",
+                "type": "task",
+                "status": "open",
+                "assignee": "",
+                "blocked_by": [],
+                "state": "frontier",
+                "path": "work/tickets/09-stats-endpoint.md"
+              },
+              {
+                "id": "10",
+                "title": "Read the tile server's existing ETag handling",
+                "type": "research",
+                "status": "open",
+                "assignee": "lead",
+                "blocked_by": [],
+                "state": "claimed",
+                "path": "work/tickets/10-etag-handling.md"
+              }
+            ],
+            "questions": [
+              {
+                "id": "q08",
+                "ticket": "02",
+                "gate": false,
+                "default": "A",
+                "asked_at": "2026-10-16T16:40:00Z",
+                "context": "Cache key: tile coordinates alone, or tile plus district id?",
+                "options": [
+                  "A. Tile coordinates only (recommended: boundary edits do not orphan entries)",
+                  "B. Tile plus district id"
+                ],
+                "answered": true,
+                "choice": "A",
+                "answered_at": "2026-10-16T18:05:00Z",
+                "applied": "2026-10-16T18:45:00Z",
+                "path": "work/inbox/q08.md",
+                "fingerprint": "ee2f12e3ba9e6c73776834fb61f84f5e89284ae48dd0fbe4f5b269337939fa75"
+              },
+              {
+                "id": "q09",
+                "ticket": "04",
+                "gate": false,
+                "default": "B",
+                "asked_at": "2026-10-17T07:12:00Z",
+                "context": "Invalidation fires on sync batch commit, and some batches touch 40,000 tiles at once.",
+                "options": [
+                  "A. Invalidate inside the commit transaction",
+                  "B. Queue invalidations and drain them in the background (recommended: commit stays under 2 s; stale tiles live under a minute)",
+                  "C. Drop the whole zoom band and rebuild lazily"
+                ],
+                "answered": false,
+                "choice": null,
+                "answered_at": null,
+                "applied": null,
+                "path": "work/inbox/q09.md",
+                "fingerprint": "dc004017c765a9150c8b734e785ce94821f8edc7cdce0aece174360c17e249ec"
+              },
+              {
+                "id": "q10",
+                "ticket": "06",
+                "gate": true,
+                "default": "A",
+                "asked_at": "2026-10-17T08:55:00Z",
+                "context": "The eviction test deletes cached tiles; the only realistic volume is the shared tiles_shared database.",
+                "options": [
+                  "A. Copy the volume to a scratch database and never delete on the shared one (recommended: the full-region batch must never be dropped)",
+                  "B. Delete on the shared volume during the night window",
+                  "C. Shrink the test to one district on a fresh database"
+                ],
+                "answered": false,
+                "choice": null,
+                "answered_at": null,
+                "applied": null,
+                "path": "work/inbox/q10.md",
+                "fingerprint": "68139a19a9be403bff933288651fb8537daa445a4745e800fa336184501d338a"
+              },
+              {
+                "id": "q11",
+                "ticket": "07",
+                "gate": false,
+                "default": "A",
+                "asked_at": "2026-10-17T10:02:00Z",
+                "context": "The writer can flush every 500 tiles or once per district; per-district flushes use 1.8 GB peak RAM.",
+                "options": [
+                  "A. Flush every 500 tiles (recommended: peak RAM stays under 300 MB on box-1)",
+                  "B. Flush once per district",
+                  "C. Make it a flag and default to 500"
+                ],
+                "answered": false,
+                "choice": null,
+                "answered_at": null,
+                "applied": null,
+                "path": "work/inbox/q11.md",
+                "fingerprint": "8fb4e7534321b75b9ce2440c7b03b52600db894728e59e7d442bd81b424f7cea"
+              }
+            ],
+            "adrs": [
+              {
+                "id": "0001",
+                "title": "Store tiles in MBTiles, one file per zoom band",
+                "path": "work/adr/0001-mbtiles-per-zoom-band.md"
+              },
+              {
+                "id": "0002",
+                "title": "Cache keys are tile coordinates only",
+                "path": "work/adr/0002-cache-key.md"
+              }
+            ],
+            "commits": [
+              {
+                "sha": "e41c09a",
+                "date": "2026-10-17T10:02:31Z",
+                "subject": "inbox: q11 flush interval for the cache writer"
+              },
+              {
+                "sha": "9b27f1d",
+                "date": "2026-10-17T09:48:10Z",
+                "subject": "07: writer streams tiles from the sync query"
+              },
+              {
+                "sha": "51aa3e0",
+                "date": "2026-10-17T08:55:44Z",
+                "subject": "inbox: q10 eviction test volume (gate)"
+              },
+              {
+                "sha": "c0f8d12",
+                "date": "2026-10-17T07:12:09Z",
+                "subject": "inbox: q09 invalidation timing"
+              },
+              {
+                "sha": "7d3e5b8",
+                "date": "2026-10-16T19:20:02Z",
+                "subject": "03: close, prototype writes 41k tiles in 38 s"
+              },
+              {
+                "sha": "2fa61c4",
+                "date": "2026-10-16T18:07:55Z",
+                "subject": "02: close, apply answer q08 (tile coordinates only)"
+              },
+              {
+                "sha": "a90de37",
+                "date": "2026-10-16T15:31:18Z",
+                "subject": "01: close, baseline 640 ms median at zoom 14"
+              },
+              {
+                "sha": "18bb2f0",
+                "date": "2026-10-16T13:04:40Z",
+                "subject": "init: map, LEAD.md, first tickets"
+              }
+            ]
+          },
+          {
+            "name": "isbn-check",
+            "path": "/home/agent/work/isbn-check",
+            "status": "idle",
+            "lead": "dead",
+            "review": "none",
+            "pane_last": null,
+            "lead_state": null,
+            "lead_note": null,
+            "lead_version": 1,
+            "result": null,
+            "map": {
+              "destination": "Flag bad ISBNs in a 40,000-record library export and suggest the likely correct one, so the weekly list shows the ten likeliest fixes first.",
+              "decisions": [
+                "- [Candidates come from three sources](tickets/01-signal-sources.md) — the export, the publisher feed, past corrections",
+                "- [Score is a weighted sum, not a model](tickets/02-scoring-shape.md) — fewer than 400 labelled corrections"
+              ]
+            },
+            "tickets": [
+              {
+                "id": "01",
+                "title": "List the ISBN sources and their refresh cadence",
+                "type": "research",
+                "status": "closed",
+                "assignee": "lead",
+                "blocked_by": [],
+                "state": "closed",
+                "path": "work/tickets/01-signal-sources.md"
+              },
+              {
+                "id": "02",
+                "title": "Pick the scoring shape",
+                "type": "grilling",
+                "status": "closed",
+                "assignee": "lead",
+                "blocked_by": [
+                  "01"
+                ],
+                "state": "closed",
+                "path": "work/tickets/02-scoring-shape.md"
+              },
+              {
+                "id": "03",
+                "title": "Load the 2024 and 2025 corrections",
+                "type": "task",
+                "status": "closed",
+                "assignee": "lead",
+                "blocked_by": [],
+                "state": "closed",
+                "path": "work/tickets/03-load-awards.md"
+              },
+              {
+                "id": "04",
+                "title": "Set the source weights",
+                "type": "grilling",
+                "status": "open",
+                "assignee": "",
+                "blocked_by": [
+                  "02"
+                ],
+                "state": "waiting",
+                "path": "work/tickets/04-weights.md"
+              },
+              {
+                "id": "05",
+                "title": "Build the weekly fix list job",
+                "type": "build",
+                "status": "open",
+                "assignee": "",
+                "blocked_by": [
+                  "04"
+                ],
+                "state": "blocked",
+                "path": "work/tickets/05-ranking-job.md"
+              },
+              {
+                "id": "06",
+                "title": "Backtest on the 2025 corrections",
+                "type": "task",
+                "status": "open",
+                "assignee": "",
+                "blocked_by": [
+                  "05"
+                ],
+                "state": "blocked",
+                "path": "work/tickets/06-backtest.md"
+              }
+            ],
+            "questions": [
+              {
+                "id": "q01",
+                "ticket": "01",
+                "gate": false,
+                "default": "B",
+                "asked_at": "2026-10-15T11:20:00Z",
+                "context": "The publisher feed is spread over 308 different sites; reading all of them takes about 2 days of work.",
+                "options": [
+                  "A. Read all 308 now",
+                  "B. Start with the 40 publishers behind most of the export (recommended: covers 81% of the records)"
+                ],
+                "answered": true,
+                "choice": "B",
+                "answered_at": "2026-10-15T17:02:00Z",
+                "applied": "2026-10-15T17:42:00Z",
+                "path": "work/inbox/q01.md",
+                "fingerprint": "bd34c74550c3c1769d2e7c6f42c8afa2c13ad695107a4bfb3928d7a32e28ec49"
+              },
+              {
+                "id": "q02",
+                "ticket": "02",
+                "gate": false,
+                "default": "A",
+                "asked_at": "2026-10-16T09:10:00Z",
+                "context": "Score shape: weighted sum or a small logistic model?",
+                "options": [
+                  "A. Weighted sum (recommended: 380 labelled corrections is too few to fit a model honestly)",
+                  "B. Logistic regression on the 380 corrections"
+                ],
+                "answered": true,
+                "choice": "A",
+                "answered_at": "2026-10-16T12:44:00Z",
+                "applied": null,
+                "path": "work/inbox/q02.md",
+                "fingerprint": "8d20c253f6ab324ec201c1513123925506c412782f0f7f3932afbcbbd06cbebe"
+              },
+              {
+                "id": "q03",
+                "ticket": "04",
+                "gate": false,
+                "default": "A",
+                "asked_at": "2026-10-16T21:37:00Z",
+                "context": "The publisher feed matched 64% of the 2025 corrections; past corrections matched 22%.",
+                "options": [
+                  "A. Weight the feed 0.6, the export 0.3, past corrections 0.1 (recommended: mirrors the 2025 hit rates)",
+                  "B. Equal weights until the backtest runs",
+                  "C. Feed only for now"
+                ],
+                "answered": false,
+                "choice": null,
+                "answered_at": null,
+                "applied": null,
+                "path": "work/inbox/q03.md",
+                "fingerprint": "77585bf3ef16b9a9c462f7a46d3337d50cbbc67ec7d38b838d154d76a45499ee"
+              }
+            ],
+            "adrs": [
+              {
+                "id": "0001",
+                "title": "The register database is the source of truth, not the sheet",
+                "path": "work/adr/0001-register-is-truth.md"
+              }
+            ],
+            "commits": [
+              {
+                "sha": "4c1d9e2",
+                "date": "2026-10-16T21:40:12Z",
+                "subject": "status: idle, only 04 remains and it waits on q03"
+              },
+              {
+                "sha": "b8e07a5",
+                "date": "2026-10-16T21:37:30Z",
+                "subject": "inbox: q03 source weights"
+              },
+              {
+                "sha": "06f3c11",
+                "date": "2026-10-16T20:15:48Z",
+                "subject": "03: close, 1,912 corrections loaded"
+              },
+              {
+                "sha": "d2a4f90",
+                "date": "2026-10-16T12:50:03Z",
+                "subject": "02: close, weighted sum per q02"
+              },
+              {
+                "sha": "5e9b7c3",
+                "date": "2026-10-15T17:10:27Z",
+                "subject": "01: close, three sources, the feed limited to 40 publishers"
+              }
+            ]
+          },
+          {
+            "name": "attachment-move",
+            "path": "/home/agent/work/attachment-move",
+            "status": "done",
+            "lead": "dead",
+            "review": "none",
+            "pane_last": null,
+            "lead_state": null,
+            "lead_note": null,
+            "lead_version": 1,
+            "result": "Copied all 14,206 tracker attachments into the helpdesk with their original timestamps and authors, and proved none was lost.\n\n## What was made\n\n- `scripts/copy_attachments.py`: copies every attachment from the old tracker into the matching helpdesk ticket, keeping the author and upload time.\n- `scripts/checksum_both.py`: compares a SHA-256 of every file on both sides and writes `reports/checksums.csv`.\n- `reports/summary.md`: counts per project, the 3 h 10 min run, and the 14,206 of 14,206 matching checksums.\n\n## How to use it\n\n1. Set `TRACKER_TOKEN` and `HELPDESK_URL` in `.env` (see `.env.example`).\n2. Run `python3 scripts/copy_attachments.py --dry-run` to see what would move.\n3. Run it without `--dry-run`, then `python3 scripts/checksum_both.py` to prove the copy.\n\n## Key files\n\n- `scripts/copy_attachments.py`\n- `scripts/checksum_both.py`\n- [reports/summary.md](../reports/summary.md)\n\n## Limits\n\n- The old tracker stays read-only; nothing was deleted there.\n- Attachments added to the old tracker after 2026-10-15 are not copied; rerun the script to pick them up.\n",
+            "map": {
+              "destination": "Move tracker attachments into the helpdesk with their original timestamps and authors, and prove nothing was lost.",
+              "decisions": [
+                "- [Copy files, keep the old tracker read-only](tickets/01-copy-strategy.md) — no deletes on the source"
+              ]
+            },
+            "tickets": [
+              {
+                "id": "01",
+                "title": "Choose the copy strategy",
+                "type": "grilling",
+                "status": "closed",
+                "assignee": "lead",
+                "blocked_by": [],
+                "state": "closed",
+                "path": "work/tickets/01-copy-strategy.md"
+              },
+              {
+                "id": "02",
+                "title": "Copy 14,206 attachments into the helpdesk",
+                "type": "build",
+                "status": "closed",
+                "assignee": "lead",
+                "blocked_by": [
+                  "01"
+                ],
+                "state": "closed",
+                "path": "work/tickets/02-copy.md"
+              },
+              {
+                "id": "03",
+                "title": "Checksum every attachment on both sides",
+                "type": "task",
+                "status": "closed",
+                "assignee": "lead",
+                "blocked_by": [
+                  "02"
+                ],
+                "state": "closed",
+                "path": "work/tickets/03-checksum.md"
+              }
+            ],
+            "questions": [
+              {
+                "id": "q01",
+                "ticket": "01",
+                "gate": true,
+                "default": "A",
+                "asked_at": "2026-10-14T10:00:00Z",
+                "context": "Moving would free 9 GB on the old tracker but deletes the originals.",
+                "options": [
+                  "A. Copy and keep the old tracker read-only (recommended: no deletion outside the work dir)",
+                  "B. Move and delete the originals"
+                ],
+                "answered": true,
+                "choice": "A",
+                "answered_at": "2026-10-14T10:25:00Z",
+                "applied": "2026-10-14T11:05:00Z",
+                "path": "work/inbox/q01.md",
+                "fingerprint": "b4126909682009dd4a32a30f947abd8029d1b66e6db64b20cd7843e28a110e63"
+              }
+            ],
+            "adrs": [],
+            "commits": [
+              {
+                "sha": "f7a20c6",
+                "date": "2026-10-15T08:12:40Z",
+                "subject": "status: done"
+              },
+              {
+                "sha": "3b6e4d1",
+                "date": "2026-10-15T08:11:02Z",
+                "subject": "03: close, 14,206 of 14,206 checksums match"
+              },
+              {
+                "sha": "8c51f0b",
+                "date": "2026-10-14T22:47:19Z",
+                "subject": "02: close, copy finished in 3 h 10 min"
+              }
+            ]
+          },
+          {
+            "name": "osm-import",
+            "path": "/home/agent/work/osm-import",
+            "status": "working 02",
+            "lead": "alive",
+            "review": "none",
+            "pane_last": "Do you want to allow Claude to fetch https://overpass-api.de/api/interpreter?",
+            "lead_state": "dialog",
+            "lead_note": "Do you want to allow Claude to fetch https://overpass-api.de/api/interpreter?",
+            "lead_version": 2,
+            "result": null,
+            "map": {
+              "destination": "Import the OSM cycle paths for a sample city into the layer model with their surfaces and widths.",
+              "decisions": []
+            },
+            "tickets": [
+              {
+                "id": "01",
+                "title": "Survey the OSM tags used for cycle paths",
+                "type": "research",
+                "status": "closed",
+                "assignee": "lead",
+                "blocked_by": [],
+                "state": "closed",
+                "path": "work/tickets/01-osm-tags.md"
+              },
+              {
+                "id": "02",
+                "title": "Fetch the cycle path ways from Overpass",
+                "type": "task",
+                "status": "open",
+                "assignee": "lead",
+                "blocked_by": [
+                  "01"
+                ],
+                "state": "claimed",
+                "path": "work/tickets/02-fetch-ways.md"
+              }
+            ],
+            "questions": [],
+            "adrs": [],
+            "commits": [
+              {
+                "sha": "a4d21f0",
+                "date": "2026-10-17T09:58:12Z",
+                "subject": "01: close, 6 tag combinations cover 94% of paths"
+              }
+            ]
+          },
+          {
+            "name": "doc-index",
+            "path": "/home/agent/work/doc-index",
+            "status": "working 04",
+            "lead": "alive",
+            "review": "none",
+            "pane_last": "❯",
+            "lead_state": "prompt",
+            "lead_note": null,
+            "lead_version": 2,
+            "result": null,
+            "map": {
+              "destination": "Index the team wiki's how-to guides so the help assistant cites the right page.",
+              "decisions": []
+            },
+            "tickets": [
+              {
+                "id": "04",
+                "title": "Chunk the guides by heading",
+                "type": "build",
+                "status": "open",
+                "assignee": "lead",
+                "blocked_by": [],
+                "state": "claimed",
+                "path": "work/tickets/04-chunking.md"
+              }
+            ],
+            "questions": [],
+            "adrs": [],
+            "commits": [
+              {
+                "sha": "5f0e9b2",
+                "date": "2026-10-17T09:41:30Z",
+                "subject": "03: close, 212 guides exported"
+              }
+            ]
+          },
+          {
+            "name": "map-export",
+            "path": "/home/agent/work/map-export",
+            "status": "working 03",
+            "lead": "dead",
+            "review": "none",
+            "pane_last": null,
+            "lead_state": null,
+            "lead_note": null,
+            "lead_version": 2,
+            "result": null,
+            "map": {
+              "destination": "Export each district's road network as one GeoPackage per layer.",
+              "decisions": []
+            },
+            "tickets": [
+              {
+                "id": "03",
+                "title": "Write the GeoPackage exporter",
+                "type": "build",
+                "status": "open",
+                "assignee": "lead",
+                "blocked_by": [],
+                "state": "claimed",
+                "path": "work/tickets/03-exporter.md"
+              }
+            ],
+            "questions": [],
+            "adrs": [],
+            "commits": [
+              {
+                "sha": "c71b3d8",
+                "date": "2026-10-17T08:12:05Z",
+                "subject": "03: exporter writes roads and junctions"
+              }
+            ]
+          },
+          {
+            "name": "tile-bench",
+            "path": "/home/agent/work/tile-bench",
+            "status": "working 02",
+            "lead": "alive",
+            "review": "none",
+            "pane_last": "You've hit your weekly limit · resets Oct 18, 2:30pm",
+            "lead_state": "limit",
+            "lead_note": "You've hit your weekly limit · resets Oct 18, 2:30pm",
+            "lead_version": 2,
+            "result": null,
+            "map": {
+              "destination": "Benchmark cached pans against the baseline on three laptops.",
+              "decisions": []
+            },
+            "tickets": [
+              {
+                "id": "02",
+                "title": "Run the zoom 14 pan suite",
+                "type": "build",
+                "status": "open",
+                "assignee": "lead",
+                "blocked_by": [],
+                "state": "claimed",
+                "path": "work/tickets/02-x.md"
+              }
+            ],
+            "questions": [],
+            "adrs": [],
+            "commits": [
+              {
+                "sha": "3d9a0e1",
+                "date": "2026-10-17T06:40:00Z",
+                "subject": "01: close, suite scripted"
+              }
+            ]
+          },
+          {
+            "name": "weekly-report",
+            "path": "/home/agent/work/weekly-report",
+            "status": "working 03",
+            "lead": "alive",
+            "review": "none",
+            "pane_last": "You've hit your session limit · resets in 45m",
+            "lead_state": "limit",
+            "lead_note": "You've hit your session limit · resets in 45m",
+            "lead_version": 2,
+            "result": null,
+            "map": {
+              "destination": "Send the weekly sales summary every Monday at 8:00.",
+              "decisions": []
+            },
+            "tickets": [
+              {
+                "id": "03",
+                "title": "Format the list as an email",
+                "type": "build",
+                "status": "open",
+                "assignee": "lead",
+                "blocked_by": [],
+                "state": "claimed",
+                "path": "work/tickets/03-x.md"
+              }
+            ],
+            "questions": [],
+            "adrs": [],
+            "commits": [
+              {
+                "sha": "7c12b5e",
+                "date": "2026-10-17T06:40:00Z",
+                "subject": "02: close, summary query in place"
+              }
+            ]
+          },
+          {
+            "name": "four-in-a-row",
+            "path": "/home/agent/work/four-in-a-row",
+            "status": "done",
+            "lead": "dead",
+            "review": "none",
+            "pane_last": null,
+            "lead_state": null,
+            "lead_note": null,
+            "lead_version": 2,
+            "result": "A four-in-a-row game for two players in one browser tab, with a computer opponent at three levels.\n\n## What was made\n\n- `index.html`, `game.js`, `style.css`: the board, turns, win detection and the computer player.\n- `tests/game.test.js`: 41 tests for wins, draws and the opponent's moves.\n\n## How to use it\n\nOpen `index.html` in a browser, or press Run it. Pick Two players or Computer and a level.\n\n## Key files\n\n- `game.js`\n- `index.html`\n\n## Limits\n\n- No online play; both players share one screen.\n",
+            "map": {
+              "destination": "A four-in-a-row game that runs from a single folder in any browser.",
+              "decisions": [
+                "- [Plain JS, no build step](tickets/01-stack.md) — the folder opens as it is"
+              ]
+            },
+            "tickets": [
+              {
+                "id": "01",
+                "title": "Pick the stack",
+                "type": "grilling",
+                "status": "closed",
+                "assignee": "lead",
+                "blocked_by": [],
+                "state": "closed",
+                "path": "work/tickets/01-stack.md"
+              },
+              {
+                "id": "02",
+                "title": "Build the board and the computer player",
+                "type": "build",
+                "status": "closed",
+                "assignee": "lead",
+                "blocked_by": [
+                  "01"
+                ],
+                "state": "closed",
+                "path": "work/tickets/02-board.md"
+              }
+            ],
+            "questions": [],
+            "adrs": [],
+            "commits": [
+              {
+                "sha": "9e3a7c1",
+                "date": "2026-10-17T07:30:44Z",
+                "subject": "status: done, result.md written"
+              },
+              {
+                "sha": "2b8f4d6",
+                "date": "2026-10-17T07:28:10Z",
+                "subject": "02: close, 41 tests pass"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "cloud-vps",
+      "ssh": "cairn@vps.example.com",
+      "node_version": null,
+      "update_available": false,
+      "port": null,
+      "allowed_tokens": [
+        "main-max"
+      ],
+      "ok": false,
+      "error": "ssh: connect to host vps.example.com port 22: Operation timed out",
+      "synced_at": "2026-10-17T10:29:55Z",
+      "snapshot": null
+    },
+    {
+      "name": "gpu-vm",
+      "ssh": "gpu-vm.example.com",
+      "node_version": "0.2.0",
+      "update_available": false,
+      "port": null,
+      "allowed_tokens": [
+        "old-pool",
+        "team-seat"
+      ],
+      "ok": true,
+      "error": null,
+      "synced_at": "2026-10-17T10:29:58Z",
+      "snapshot": {
+        "node_version": "0.2.0",
+        "host": "gpu-vm",
+        "time": "2026-10-17T10:29:57Z",
+        "free_ram_mb": 6210,
+        "free_disk_mb": 18420,
+        "deps": {
+          "tmux": "3.3a",
+          "git": "2.39.5",
+          "python3": "3.11.2",
+          "claude": null
+        },
+        "projects": []
+      }
+    }
+  ],
+  "notify": {
+    "configured": true,
+    "enabled": true,
+    "last_error": null
+  },
+  "tokens": [
+    {
+      "label": "main-max",
+      "kind": "oauth",
+      "account": "me (Max)",
+      "last4": "x7Qa",
+      "expires": "2027-10-17T00:00:00Z",
+      "in_use": [
+        "box-1/tile-cache"
+      ],
+      "limits": [
+        {
+          "node": null,
+          "until": "2026-10-18T13:30:00Z",
+          "known": true
+        }
+      ]
+    },
+    {
+      "label": "second-pro",
+      "kind": "oauth",
+      "account": "me (Pro)",
+      "last4": "Lm2c",
+      "expires": "2026-11-02T00:00:00Z",
+      "in_use": [],
+      "limits": [
+        {
+          "node": null,
+          "until": "2026-10-18T16:00:00Z",
+          "known": false
+        }
+      ]
+    },
+    {
+      "label": "old-pool",
+      "kind": "shared-pool",
+      "account": "shared pool",
+      "last4": "9f3d",
+      "expires": null,
+      "in_use": [],
+      "limits": []
+    },
+    {
+      "label": "team-seat",
+      "kind": "node-login",
+      "account": "the node's own login",
+      "last4": "",
+      "expires": null,
+      "in_use": [],
+      "limits": []
+    }
+  ],
+  "projects": {
+    "box-1/tile-bench": {
+      "token": "main-max",
+      "model": "sonnet",
+      "subagent_model": null,
+      "copied_sha": null,
+      "copied_to": null,
+      "result_ready": false,
+      "running_url": null,
+      "attention": {
+        "kind": "limit",
+        "since": "2026-10-17T09:55:00Z",
+        "note": "You've hit your weekly limit · resets Oct 18, 2:30pm",
+        "resume_at": "2026-10-18T13:32:00Z",
+        "resume_error": null,
+        "resume_attempts": 0,
+        "token": "main-max",
+        "until": "2026-10-18T13:30:00Z",
+        "known": true,
+        "switch_to": null,
+        "switched_to": null
+      },
+      "mirror": {
+        "path": "~/.cairn/mirror/box-1/tile-bench.git",
+        "sha": "3d9a0e1",
+        "synced_at": "2026-10-17T10:30:00Z",
+        "error": null
+      },
+      "tokens": [
+        "main-max",
+        "second-pro"
+      ],
+      "limits": {
+        "main-max": {
+          "until": "2026-10-18T13:30:00Z",
+          "known": true
+        },
+        "second-pro": {
+          "until": "2026-10-18T16:00:00Z",
+          "known": false
+        }
+      }
+    },
+    "box-1/weekly-report": {
+      "token": "team-seat",
+      "model": null,
+      "subagent_model": null,
+      "copied_sha": null,
+      "copied_to": null,
+      "result_ready": false,
+      "running_url": null,
+      "attention": {
+        "kind": "limit",
+        "since": "2026-10-17T09:20:00Z",
+        "note": "You've hit your session limit · resets in 45m",
+        "resume_at": "2026-10-17T10:45:00Z",
+        "resume_error": "start failed: the pane shows \"Not logged in\" (token team-seat)",
+        "resume_attempts": 2,
+        "token": "main-max",
+        "until": "2026-10-17T10:05:00Z",
+        "known": true,
+        "switch_to": "team-seat",
+        "switched_to": "team-seat"
+      },
+      "mirror": {
+        "path": "~/.cairn/mirror/box-1/weekly-report.git",
+        "sha": "7c12b5e",
+        "synced_at": "2026-10-17T10:30:00Z",
+        "error": null
+      },
+      "tokens": [
+        "main-max",
+        "team-seat"
+      ],
+      "limits": {
+        "main-max": {
+          "until": "2026-10-17T10:05:00Z",
+          "known": true
+        }
+      }
+    },
+    "box-1/osm-import": {
+      "token": "main-max",
+      "model": "sonnet",
+      "subagent_model": "haiku",
+      "copied_sha": null,
+      "copied_to": null,
+      "result_ready": false,
+      "running_url": null,
+      "attention": {
+        "kind": "dialog",
+        "since": "2026-10-17T10:21:00Z",
+        "note": "Do you want to allow Claude to fetch https://overpass-api.de/api/interpreter?",
+        "resume_at": null
+      },
+      "mirror": {
+        "path": "~/.cairn/mirror/box-1/osm-import.git",
+        "sha": "a4d21f0",
+        "synced_at": "2026-10-17T10:30:00Z",
+        "error": null
+      }
+    },
+    "box-1/doc-index": {
+      "token": "main-max",
+      "model": null,
+      "subagent_model": null,
+      "copied_sha": null,
+      "copied_to": null,
+      "result_ready": false,
+      "running_url": null,
+      "attention": {
+        "kind": "prompt",
+        "since": "2026-10-17T10:04:00Z",
+        "note": null,
+        "resume_at": null
+      },
+      "mirror": {
+        "path": "~/.cairn/mirror/box-1/doc-index.git",
+        "sha": "5f0e9b2",
+        "synced_at": "2026-10-17T10:30:00Z",
+        "error": null
+      }
+    },
+    "box-1/map-export": {
+      "token": "team-seat",
+      "model": "opus",
+      "subagent_model": null,
+      "copied_sha": null,
+      "copied_to": null,
+      "result_ready": false,
+      "running_url": null,
+      "attention": {
+        "kind": "crashed",
+        "since": "2026-10-17T09:47:00Z",
+        "note": "The lead's session ended while its status said working 03.",
+        "resume_at": null
+      },
+      "mirror": {
+        "path": "~/.cairn/mirror/box-1/map-export.git",
+        "sha": "c71b3d8",
+        "synced_at": "2026-10-17T10:30:00Z",
+        "error": null
+      }
+    },
+    "box-1/four-in-a-row": {
+      "token": "main-max",
+      "model": "sonnet",
+      "subagent_model": "haiku",
+      "copied_sha": "9e3a7c1d84f02b6e5a91c37d0f6b28e4a1c5d903",
+      "copied_to": "/Users/you/Downloads/four-in-a-row",
+      "result_ready": false,
+      "running_url": "http://127.0.0.1:53817/",
+      "attention": null,
+      "mirror": {
+        "path": "~/.cairn/mirror/box-1/four-in-a-row.git",
+        "sha": "9e3a7c1",
+        "synced_at": "2026-10-17T10:30:00Z",
+        "error": null
+      }
+    },
+    "box-1/tile-cache": {
+      "token": "main-max",
+      "attention": {
+        "kind": "limit",
+        "since": "2026-10-17T10:12:00Z",
+        "note": "You've hit your session limit · resets in 2h",
+        "resume_at": "2026-10-17T12:14:00Z"
+      },
+      "running_url": null,
+      "model": "opus",
+      "subagent_model": "sonnet",
+      "copied_sha": null,
+      "copied_to": null,
+      "result_ready": false,
+      "mirror": {
+        "path": "~/.cairn/mirror/box-1/tile-cache.git",
+        "sha": "e41c09a",
+        "synced_at": "2026-10-17T10:30:00Z",
+        "error": null
+      }
+    },
+    "box-1/isbn-check": {
+      "token": "team-seat",
+      "attention": {
+        "kind": "limit",
+        "since": "2026-10-17T07:30:00Z",
+        "note": "Usage limit reached · resets 11:23am",
+        "resume_at": "2026-10-17T10:25:00Z",
+        "resume_error": null,
+        "resume_attempts": 0
+      },
+      "running_url": null,
+      "model": null,
+      "subagent_model": "haiku",
+      "copied_sha": null,
+      "copied_to": null,
+      "result_ready": false,
+      "mirror": {
+        "path": "~/.cairn/mirror/box-1/isbn-check.git",
+        "sha": "b8e07a5",
+        "synced_at": "2026-10-17T09:10:30Z",
+        "error": "git fetch --prune: fatal: the remote end hung up unexpectedly (index.lock held on the node)"
+      }
+    },
+    "box-1/attachment-move": {
+      "token": "main-max",
+      "attention": null,
+      "running_url": null,
+      "model": "sonnet",
+      "subagent_model": null,
+      "copied_sha": "3b6e4d1a90c2f75e81d34b6c0e2a9f17d58c3b40",
+      "result_ready": true,
+      "copied_to": "/Users/you/Downloads/attachment-move",
+      "mirror": {
+        "path": "~/.cairn/mirror/box-1/attachment-move.git",
+        "sha": "f7a20c6",
+        "synced_at": "2026-10-17T10:30:00Z",
+        "error": null
+      }
+    }
+  }
+}

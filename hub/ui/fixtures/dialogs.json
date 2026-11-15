@@ -1,0 +1,62 @@
+{
+  "box-1/osm-import": {
+    "lines": [
+      " Fetch",
+      "",
+      "   https://overpass-api.de/api/interpreter",
+      "   Claude wants to fetch content from overpass-api.de",
+      "",
+      " Do you want to allow Claude to fetch https://overpass-api.de/api/interpreter?",
+      " ❯ 1. Yes",
+      "   2. Yes, and don't ask again for overpass-api.de",
+      "   3. No, and tell Claude what to do differently (esc)"
+    ],
+    "options": [
+      {
+        "n": 1,
+        "label": "Yes"
+      },
+      {
+        "n": 2,
+        "label": "Yes, and don't ask again for overpass-api.de"
+      },
+      {
+        "n": 3,
+        "label": "No, and tell Claude what to do differently (esc)"
+      }
+    ],
+    "selected": 1,
+    "next": {
+      "lines": [
+        " Bash command",
+        "",
+        " │ cd /tmp/claude-1000/-home-agent-work-osm-import/ef4c8444-40b1-4139-b6ef-75772fd4",
+        " │ c314/scratchpad && mkdir -p extract && cd extract && rm -rf * && unzip",
+        " │ -qo ../downloads/portugal-latest*/extract.zip && ls; python3 -I -",
+        " │ <<'EOF'",
+        " │ import json,glob",
+        " │ EOF",
+        "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+        " │ Dangerous rm operation on statically-unresolvable target:",
+        " │ /home/agent/work/osm-import/*",
+        "",
+        " Do you want to proceed?",
+        " ❯ 1. Yes",
+        "   2. No",
+        "",
+        " Esc to cancel · Tab to amend · ctrl+x ctrl+k twice to stop background agents"
+      ],
+      "options": [
+        {
+          "n": 1,
+          "label": "Yes"
+        },
+        {
+          "n": 2,
+          "label": "No"
+        }
+      ],
+      "selected": 1
+    }
+  }
+}

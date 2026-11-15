@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Fake cairn-node for hub tests. Logs argv and the first stdin line to $FAKE_NODE_LOG."""
+import json
+import os
+import sys
+import time
+
+argv = sys.argv[1:]
+cmd = argv[0] if argv else ""
+stdin_first = ""
+if cmd in ("start", "review", "init", "ticket", "chat", "answer", "stop", "relead", "usage"):
+    stdin_first = sys.stdin.buffer.readline().decode().rstrip("\n")
+log = os.environ.get("FAKE_NODE_LOG")
+if log:
+    with open(log, "a") as f:
+        f.write(json.dumps({"argv": argv, "stdin": stdin_first}) + "\n")
+
+SNAP = {"node_version": os.environ.get("FAKE_NODE_VERSION", "0.4.0"), "host": "fakehost", "time": "2026-10-17T12:00:00Z",
+        "free_ram_mb": 1000, "free_disk_mb": 5000,
+        "deps": {"tmux": "3.3a", "git": "2.39.5", "python3": "3.11.2", "claude": None},
+        "projects": [{"name": "demo", "path": "/tmp/demo", "status": "idle", "lead": "none", "review": "none",
+                      "map": {"destination": "d", "decisions": []}, "tickets": [], "questions": [],
+                      "adrs": [], "commits": []}]}
+
+if os.environ.get("FAKE_NODE_PROJECTS"):
+    with open(os.environ["FAKE_NODE_PROJECTS"]) as f:
+        SNAP["projects"] = json.load(f)
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def chat(token):
+    """Speak claude's stream-json. "b" answers every open question in the snapshot file."""
+    mode = os.environ.get("FAKE_CHAT_MODE", "")
+    if mode == "die":
+        emit({"error": "unknown project: demo"})
+        sys.exit(1)
+    if mode == "slow-head":
+        time.sleep(1)
+    emit({"type": "cairn", "session_id": "11111111-1111-4111-8111-111111111111", "resumed": "--resume" in argv})
+    for raw in sys.stdin.buffer:
+        content = json.loads(raw)["message"]["content"]
+        with open(log, "a") as f:
+            f.write(json.dumps({"chat_in": content}) + "\n")
+        emit({"type": "system", "subtype": "init", "cwd": "/tmp/demo"})
+        if mode == "slow":
+            time.sleep(1.5)
+        if mode == "die-midturn":
+            sys.stderr.write("client_loop: send disconnect: Broken pipe\n")
+            sys.stderr.flush()
+            sys.exit(255)
+        if mode == "nologin":
+            emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "Not logged in \u00b7 Please run /login"}]}})
+            emit({"type": "result", "subtype": "success", "is_error": True, "result": "Not logged in", "duration_ms": 10})
+            continue
+        text = "reply to %s" % content + (" " + token if mode == "echo-secret" else "")
+        if mode == "quote-key":
+            text = "**q01** Staging returns `Invalid API key` since the rotation; rotate?"
+        if mode == "finish":
+            text += "\n\nReview finished."
+        command = "echo " + "x" * 130 + " " + token if mode == "tool-secret" else "cat work/inbox/q01.md\nsecond line"
+        emit({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": text},
+            {"type": "tool_use", "name": "Bash", "input": {"command": command}}]}})
+        emit({"type": "user", "message": {"content": [{"type": "tool_result", "content": "raw tool output"}]}})
+        if content == "b" and os.environ.get("FAKE_NODE_PROJECTS"):
+            path = os.environ["FAKE_NODE_PROJECTS"]
+            with open(path) as f:
+                projects = json.load(f)
+            for p in projects:
+                for q in p.get("questions") or []:
+                    q.update(answered=True, choice="B")
+            with open(path, "w") as f:
+                json.dump(projects, f)
+        emit({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 1500, "total_cost_usd": 0.01})
+
+if cmd == "start" and os.environ.get("FAKE_NODE_START_FAIL"):
+    print(json.dumps({"error": "claude in demo has no usable login: Not logged in", "pane": ["Not logged in"]}))
+    sys.exit(1)
+if cmd == "ticket":
+    try:
+        op = json.loads(stdin_first)
+    except ValueError:
+        op = {}
+    if op.get("op") not in ("create", "close", "out-of-scope", "blockers") or os.environ.get("FAKE_NODE_TICKET_FAIL"):
+        print(json.dumps({"error": "ticket 01 is claimed by lead"}))
+        sys.exit(1)
+    print(json.dumps({"id": "01", "path": "work/tickets/01-x.md", "commit": "abc1234"}))
+    sys.exit(0)
+if cmd == "chat":
+    chat(stdin_first)
+    sys.exit(0)
+if cmd == "answer":
+    op = json.loads(stdin_first or "{}")
+    if os.environ.get("FAKE_NODE_ANSWER_FAIL"):
+        print(json.dumps({"error": "q01 is already answered"}))
+        sys.exit(1)
+    # as cairn-node 0.4.3: a fingerprint, when sent, must match the question's in the snapshot
+    question = next((q for p in SNAP["projects"] for q in p.get("questions") or [] if q.get("id") == op.get("id")), None)
+    if "fingerprint" in op and question is not None and op["fingerprint"] != question.get("fingerprint"):
+        print(json.dumps({"error": "%s changed since it was shown; read it again" % op["id"], "question": question}))
+        sys.exit(1)
+    print(json.dumps({"id": op.get("id"), "choice": op.get("choice"), "answered_at": "2026-10-17T12:00:00Z",
+                      "path": "work/inbox/%s.answer.md" % op.get("id")}))
+    sys.exit(0)
+DIALOG = {"lines": [" Do you want to proceed?", " ❯ 1. Yes", "   2. No"], "options": [{"n": 1, "label": "Yes"}, {"n": 2, "label": "No"}],
+          "selected": 1, "fingerprint": "f" * 64}
+if cmd == "dialog-answer" and os.environ.get("FAKE_NODE_DIALOG_GONE"):
+    print(json.dumps({"error": "no session demo"}))
+    sys.exit(1)
+if cmd == "dialog-answer" and os.environ.get("FAKE_NODE_DIALOG_STALE"):
+    print(json.dumps({"error": "the dialog changed; read it again", "dialog": DIALOG}))
+    sys.exit(1)
+if cmd == "snapshot":
+    out = SNAP
+elif cmd == "dialog":
+    out = {"dialog": DIALOG}
+elif cmd == "dialog-answer":
+    out = {"answered": int(argv[3]), "label": "No", "dialog": None}
+elif cmd == "read":
+    out = {"path": argv[2], "content": "hello"}
+elif cmd == "pane":
+    out = {"lines": ["line1"]}
+elif cmd == "start":
+    out = {"session": argv[1], "resumed": False, "session_id": "00000000-0000-4000-8000-000000000000"}
+elif cmd == "stop":
+    out = {"stopped": True}
+elif cmd == "review":
+    out = {"session": argv[1] + "-review", "attach": "tmux -L cairn attach -t %s-review" % argv[1]}
+elif cmd == "init":
+    out = {"project": argv[1], "path": "/tmp/" + argv[1]}
+elif cmd == "relead":
+    out = {"version": 2, "commit": "abc1234"}
+elif cmd == "usage":
+    out = {"models": [{"model": "claude-fable-5-1", "input": 3, "output": 50, "cache_read": 300, "cache_write": 15,
+                       "messages": 3}], "sessions": 1, "first_at": None, "last_at": None, "active_minutes": 2, "files": 1}
+else:
+    print(json.dumps({"error": "unknown command"}))
+    sys.exit(2)
+print(json.dumps(out))

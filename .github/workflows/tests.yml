@@ -1,0 +1,47 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  hub:
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]   # 3.11 resolves to its newest patch, above the hub's 3.11.4 floor
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: git identity for the test repos
+        run: |
+          git config --global user.name cairn-ci
+          git config --global user.email cairn-ci@example.com
+          git config --global init.defaultBranch main
+      - name: hub tests
+        run: python3 -m unittest discover -s hub/tests
+
+  node:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-latest, python: "3.12"}
+          - {os: macos-latest, python: "3.13"}
+          - {os: ubuntu-latest, python: "3.11"}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: git identity for the test repos
+        run: |
+          git config --global user.name cairn-ci
+          git config --global user.email cairn-ci@example.com
+          git config --global init.defaultBranch main
+      - name: node tests
+        run: python3 -m unittest discover -s node/tests

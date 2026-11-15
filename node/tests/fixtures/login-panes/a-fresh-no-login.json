@@ -1,0 +1,53 @@
+{
+ "claude_code": "2.1.304",
+ "captured": "2026-11-15",
+ "synthetic": false,
+ "synthetic_history": false,
+ "prompt": "start",
+ "how": "cairn-node 0.4.4 cmd_start -> new_session, unchanged, inside a throwaway container from the cairn-dev:0.1 image (Debian bookworm, tmux 3.3a, Python 3.11.2), with watch_start replaced by a recorder that ran the watch's own capture, `tmux -L cairn capture-pane -p -t =demo: -S -60`, every 0.1-0.5 s. The pane is tmux's default 80x24 for a detached session. Lines are as captured; the token check's `sk-ant-` redaction was applied.",
+ "note": "Case a: a container that was never signed in, started with an empty token line (node-login). No onboarding or login picker: cairn-node marks onboarding done in ~/.claude.json before the start. The failure is a `⎿` line under the prompt echo and a footer line under the input box; there is no `●` line at all.",
+ "frames": [
+  {
+   "t": 1.5,
+   "expect": "failure",
+   "lines": [
+    " ▐▛███▛█   Claude Code v2.1.304",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/work/demo",
+    "",
+    "",
+    "❯ Read LEAD.md and work the map.",
+    "  ⎿  Not logged in · Please run /login",
+    "",
+    "✻ Cogitated for 0s · done 11:59 AM",
+    "",
+    "────────────────────────────────────────────────────────────────────────────────",
+    "❯ ",
+    "────────────────────────────────────────────────────────────────────────────────",
+    "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+    "                                                    Not logged in · Run /login",
+    "                                                            ◐ medium · /effort"
+   ]
+  },
+  {
+   "t": 19.3,
+   "expect": "failure",
+   "lines": [
+    " ▐▛███▛█   Claude Code v2.1.304",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/work/demo",
+    "",
+    "",
+    "❯ Read LEAD.md and work the map.",
+    "  ⎿  Not logged in · Please run /login",
+    "",
+    "✻ Cogitated for 0s · done 11:59 AM",
+    "",
+    "────────────────────────────────────────────────────────────────────────────────",
+    "❯ ",
+    "────────────────────────────────────────────────────────────────────────────────",
+    "  ⏵⏵ bypass permissions on (shift+tab to cycle)     Not logged in · Run /login"
+   ]
+  }
+ ]
+}

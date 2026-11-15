@@ -1,0 +1,11 @@
+{
+  "box-1/four-in-a-row": {"models": [
+      {"model": "claude-sonnet-4-5", "input": 48210, "output": 391877, "cache_read": 18402911, "cache_write": 1290455, "messages": 612},
+      {"model": "claude-fable-5", "input": 9120, "output": 88412, "cache_read": 2210388, "cache_write": 301772, "messages": 97},
+      {"model": "claude-haiku-4-5", "input": 31877, "output": 40230, "cache_read": 1904112, "cache_write": 210903, "messages": 288}],
+    "sessions": 4, "first_at": "2026-10-16T21:02:11Z", "last_at": "2026-10-17T07:30:40Z", "active_minutes": 173, "files": 19},
+  "box-1/tile-cache": {"models": [
+      {"model": "claude-opus-4-1", "input": 71004, "output": 512330, "cache_read": 30551209, "cache_write": 2214930, "messages": 905},
+      {"model": "claude-sonnet-4-5", "input": 22914, "output": 120003, "cache_read": 6610032, "cache_write": 540117, "messages": 340}],
+    "sessions": 7, "first_at": "2026-10-16T13:04:02Z", "last_at": "2026-10-17T10:12:00Z", "active_minutes": 486, "files": 31}
+}
